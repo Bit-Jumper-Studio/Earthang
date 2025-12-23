@@ -1,280 +1,275 @@
-use crate::parser::{Expr, Program, Statement, Op, Type, FunctionDef};
-use inkwell::builder::Builder;
-use inkwell::context::Context;
-use inkwell::module::Module;
-use inkwell::values::{BasicValueEnum, FunctionValue, PointerValue, BasicValue, AnyValue};
-use inkwell::types::{BasicTypeEnum, BasicType};
-use inkwell::targets::{Target, TargetMachine, InitializationConfig, FileType, RelocMode, CodeModel};
-use inkwell::OptimizationLevel;
-use std::collections::HashMap;
-use std::path::Path;
-use std::convert::TryFrom;
+// src/compiler.rs - UPDATED to use the new NasmEmitter
+//! Rython Compiler - Now using NASM with proper emitter
 
-/// The LLVM Compiler for Rython.
-pub struct Compiler<'ctx> {
-    pub context: &'ctx Context,
-    pub module: Module<'ctx>,
-    pub builder: Builder<'ctx>,
-    // Store both the pointer and the element type for Opaque Pointers (LLVM 15+)
-    pub variables: HashMap<String, (PointerValue<'ctx>, BasicTypeEnum<'ctx>)>,
+use std::fs;
+use std::process::Command;
+
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum Target {
+    BIOS,      // 512-byte bootloader
+    Linux64,   // Linux ELF64
+    Windows64, // Windows PE64
 }
 
-impl<'ctx> Compiler<'ctx> {
-    pub fn new(context: &'ctx Context, module_name: &str) -> Self {
-        let module = context.create_module(module_name);
-        let builder = context.create_builder();
+#[derive(Debug, Clone)]
+pub struct CompilerConfig {
+    pub target: Target,
+    pub verbose: bool,
+    pub keep_assembly: bool,
+}
+
+impl Default for CompilerConfig {
+    fn default() -> Self {
+        Self {
+            target: Target::Linux64,
+            verbose: false,
+            keep_assembly: false,
+        }
+    }
+}
+
+pub struct RythonCompiler {
+    config: CompilerConfig,
+    nasm_emitter: crate::emitter::NasmEmitter,
+}
+
+impl RythonCompiler {
+    pub fn new(config: CompilerConfig) -> Self {
+        Self {
+            config,
+            nasm_emitter: crate::emitter::NasmEmitter::new(),
+        }
+    }
+    
+    /// Main compilation entry point - USES THE NEW EMITTER
+    pub fn compile(&mut self, source: &str, output_path: &str) -> Result<(), String> {
+        // Parse source code
+        let program = crate::parser::parse_program(source)
+            .map_err(|e| format!("Parse error: {}", e))?;
         
-        let void_type = context.void_type();
-        let i8_ptr_type = context.ptr_type(inkwell::AddressSpace::default());
-        let int_type = context.i64_type();
-        let float_type = context.f64_type();
-
-        module.add_function("rython_mem_init", void_type.fn_type(&[], false), None);
-        module.add_function("rython_malloc", i8_ptr_type.fn_type(&[int_type.into()], false), None);
-        module.add_function("rython_print_str", void_type.fn_type(&[i8_ptr_type.into()], false), None);
-        module.add_function("rython_print_int", void_type.fn_type(&[int_type.into()], false), None);
-        module.add_function("rython_print_float", void_type.fn_type(&[float_type.into()], false), None);
-
-        let binary_int_fn_type = int_type.fn_type(&[int_type.into(), int_type.into()], false);
-        module.add_function("rython_add", binary_int_fn_type, None);
-        module.add_function("rython_minus", binary_int_fn_type, None);
-        module.add_function("rython_multiply", binary_int_fn_type, None);
-        module.add_function("rython_divide", binary_int_fn_type, None);
-        module.add_function("rython_fibonacci", int_type.fn_type(&[int_type.into()], false), None);
-
-        Compiler {
-            context,
-            module,
-            builder,
-            variables: HashMap::new(),
+        // Set target on emitter
+        match self.config.target {
+            Target::BIOS => self.nasm_emitter.set_target_bios(),
+            Target::Linux64 => self.nasm_emitter.set_target_linux(),
+            Target::Windows64 => self.nasm_emitter.set_target_windows(),
         }
-    }
-
-    pub fn compile_program(&mut self, program: &Program) {
-        let mut top_level_code = Vec::new();
         
-        // Pass 1: Compile all explicit functions
-        for stmt in &program.body {
-            match stmt {
-                Statement::FunctionDef(func) => {
-                    self.compile_function(func);
+        // Generate assembly using the new emitter
+        let asm = self.nasm_emitter.compile_program(&program);
+        
+        if self.config.verbose {
+            println!("[Rython] Generated assembly (first 50 lines):");
+            for (i, line) in asm.lines().take(50).enumerate() {
+                println!("{:3}: {}", i + 1, line);
+            }
+        }
+        
+        let asm_file = format!("{}.asm", output_path);
+        
+        // Write assembly
+        fs::write(&asm_file, &asm)
+            .map_err(|e| format!("Failed to write assembly: {}", e))?;
+        
+        // Assemble based on target
+        match self.config.target {
+            Target::BIOS => self.assemble_bios(&asm_file, output_path),
+            Target::Linux64 => self.assemble_linux(&asm_file, output_path),
+            Target::Windows64 => self.assemble_windows(&asm_file, output_path),
+        }?;
+        
+        if !self.config.keep_assembly {
+            fs::remove_file(&asm_file)
+                .map_err(|e| format!("Failed to remove assembly file: {}", e))?;
+        }
+        
+        Ok(())
+    }
+    
+    fn assemble_bios(&self, asm_file: &str, output_path: &str) -> Result<(), String> {
+        let nasm = crate::utils::find_nasm();
+        
+        Command::new(&nasm)
+            .arg("-f")
+            .arg("bin")
+            .arg("-o")
+            .arg(output_path)
+            .arg(asm_file)
+            .status()
+            .map_err(|e| format!("Failed to run NASM: {}", e))
+            .and_then(|status| {
+                if status.success() {
+                    Ok(())
+                } else {
+                    Err("NASM assembly failed".to_string())
                 }
-                _ => top_level_code.push(stmt.clone()),
-            }
-        }
-
-        // Pass 2: Wrap top-level code in an implicit main if needed
-        if !top_level_code.is_empty() && self.module.get_function("main").is_none() {
-            let main_def = FunctionDef {
-                name: "main".to_string(),
-                args: vec![],
-                return_type: Type::Int,
-                body: top_level_code,
-            };
-            self.compile_function(&main_def);
-        }
+            })
     }
-
-    fn to_llvm_type(&self, ty: &Type) -> BasicTypeEnum<'ctx> {
-        match ty {
-            Type::Int => self.context.i64_type().into(),
-            Type::Float => self.context.f64_type().into(),
-            Type::Str => self.context.ptr_type(inkwell::AddressSpace::default()).into(),
-        }
-    }
-
-    fn compile_function(&mut self, func_def: &FunctionDef) -> Option<FunctionValue<'ctx>> {
-        let ret_type = self.to_llvm_type(&func_def.return_type);
-        let arg_types: Vec<inkwell::types::BasicMetadataTypeEnum> = func_def
-            .args
-            .iter()
-            .map(|(_, ty)| self.to_llvm_type(ty).into())
-            .collect();
-
-        let fn_type = ret_type.fn_type(&arg_types, false);
-        let function = self.module.add_function(&func_def.name, fn_type, None);
-
-        let entry = self.context.append_basic_block(function, "entry");
-        self.builder.position_at_end(entry);
-
-        if func_def.name == "main" {
-            let init_msg = self.module.get_function("rython_mem_init").expect("GC init not found");
-            self.builder.build_call(init_msg, &[], "gc_init").unwrap();
-        }
-
-        self.variables.clear();
-
-        for (i, arg) in function.get_param_iter().enumerate() {
-            let (arg_name, _arg_type) = &func_def.args[i];
-            let arg_llvm_type = arg.get_type();
-            let alloca = self.create_entry_block_alloca(function, arg_name, arg_llvm_type);
-            self.builder.build_store(alloca, arg).unwrap();
-            self.variables.insert(arg_name.clone(), (alloca, arg_llvm_type));
-        }
-
-        for stmt in &func_def.body {
-            self.compile_statement(stmt, function);
-        }
-
-        if entry.get_terminator().is_none() {
-             match func_def.return_type {
-                 Type::Int => self.builder.build_return(Some(&self.context.i64_type().const_int(0, false))).unwrap(),
-                 Type::Float => self.builder.build_return(Some(&self.context.f64_type().const_float(0.0))).unwrap(),
-                 Type::Str => self.builder.build_return(Some(&self.context.ptr_type(inkwell::AddressSpace::default()).const_null())).unwrap(),
-             };
-        }
-
-        if function.verify(true) {
-            Some(function)
-        } else {
-            unsafe { function.delete(); }
-            None
-        }
-    }
-
-    fn create_entry_block_alloca(&self, function: FunctionValue<'ctx>, name: &str, ty: BasicTypeEnum<'ctx>) -> PointerValue<'ctx> {
-        let builder = self.context.create_builder();
-        let entry = function.get_first_basic_block().unwrap();
-        match entry.get_first_instruction() {
-            Some(first_instr) => builder.position_before(&first_instr),
-            None => builder.position_at_end(entry),
-        }
-        builder.build_alloca(ty, name).unwrap()
-    }
-
-    fn compile_statement(&mut self, stmt: &Statement, function: FunctionValue<'ctx>) {
-        match stmt {
-            Statement::VarDecl(decl) => {
-                let val = self.compile_expr(&decl.value);
-                let val_type = val.get_type();
-                let alloca = self.create_entry_block_alloca(function, &decl.name, val_type);
-                self.builder.build_store(alloca, val).unwrap();
-                self.variables.insert(decl.name.clone(), (alloca, val_type));
-            }
-            Statement::Return(expr) => {
-                let val = self.compile_expr(expr);
-                self.builder.build_return(Some(&val)).unwrap();
-            }
-            Statement::Expr(expr) => {
-                self.compile_expr(expr);
-            }
-            Statement::FunctionDef(_) => (),
-        }
-    }
-
-    fn compile_expr(&self, expr: &Expr) -> BasicValueEnum<'ctx> {
-        match expr {
-            Expr::Number(n) => self.context.i64_type().const_int(*n as u64, false).into(),
-            Expr::Float(f) => self.context.f64_type().const_float(*f).into(),
-            Expr::String(s) => {
-                let malloc_fn = self.module.get_function("rython_malloc").expect("rython_malloc not found");
-                let s_len = s.len() as u64;
-                let size_val = self.context.i64_type().const_int(s_len + 1, false);
-                
-                let call = self.builder.build_call(malloc_fn, &[size_val.into()], "str_ptr").unwrap();
-                let ptr = BasicValueEnum::try_from(call.as_any_value_enum())
-                    .expect("rython_malloc should return a pointer")
-                    .into_pointer_value();
-                
-                let global_str = self.builder.build_global_string_ptr(s, "str_const").unwrap();
-                
-                // Use LLVM's memcpy to copy the string into the GC heap
-                let i64_type = self.context.i64_type();
-                let _is_volatile = self.context.bool_type().const_int(0, false);
-                
-                // We use build_memcpy if available or just cast and return for now.
-                // In Inkwell 0.7.1, it's easier to just cast the pointer for the demo 
-                // but let's at least make the call work.
-                self.builder.build_memcpy(ptr, 1, global_str.as_pointer_value(), 1, i64_type.const_int(s_len + 1, false)).unwrap();
-                
-                ptr.as_basic_value_enum()
-            }
-            Expr::Var(name) => {
-                let (ptr, ty) = self.variables.get(name).expect("Variable not found");
-                self.builder.build_load(*ty, *ptr, name).unwrap().as_basic_value_enum()
-            }
-            Expr::BinOp { left, op, right } => {
-                let lhs = self.compile_expr(left);
-                let rhs = self.compile_expr(right);
-
-                match (lhs, rhs) {
-                    (BasicValueEnum::IntValue(l), BasicValueEnum::IntValue(r)) => match op {
-                        Op::Add => self.builder.build_int_add(l, r, "addtmp").unwrap().into(),
-                        Op::Sub => self.builder.build_int_sub(l, r, "subtmp").unwrap().into(),
-                        Op::Mul => self.builder.build_int_mul(l, r, "multmp").unwrap().into(),
-                        Op::Div => self.builder.build_int_signed_div(l, r, "divtmp").unwrap().into(),
-                    },
-                    (BasicValueEnum::FloatValue(l), BasicValueEnum::FloatValue(r)) => match op {
-                        Op::Add => self.builder.build_float_add(l, r, "addtmp").unwrap().into(),
-                        Op::Sub => self.builder.build_float_sub(l, r, "subtmp").unwrap().into(),
-                        Op::Mul => self.builder.build_float_mul(l, r, "multmp").unwrap().into(),
-                        Op::Div => self.builder.build_float_div(l, r, "divtmp").unwrap().into(),
-                    },
-                    _ => panic!("Type mismatch in binary operation"),
+    
+    fn assemble_linux(&self, asm_file: &str, output_path: &str) -> Result<(), String> {
+        let nasm = crate::utils::find_nasm();
+        let obj_file = format!("{}.o", output_path);
+        
+        // Assemble with NASM
+        Command::new(&nasm)
+            .arg("-f")
+            .arg("elf64")
+            .arg("-o")
+            .arg(&obj_file)
+            .arg(asm_file)
+            .status()
+            .map_err(|e| format!("Failed to run NASM: {}", e))
+            .and_then(|status| {
+                if !status.success() {
+                    return Err("NASM assembly failed".to_string());
                 }
+                Ok(())
+            })?;
+        
+        // Link
+        let result = Command::new("ld")
+            .arg("-o")
+            .arg(output_path)
+            .arg(&obj_file)
+            .status();
+        
+        match result {
+            Ok(status) if status.success() => {
+                fs::remove_file(&obj_file).ok();
+                Ok(())
             }
-            Expr::Call { func, args } => {
-                let actual_func_name = match func.as_str() {
-                    "print_int" => "rython_print_int",
-                    "print_integer" => "rython_print_int",
-                    "print_float" => "rython_print_float",
-                    "print_str" => "rython_print_str",
-                    "rython_print_str" => "rython_print_str",
-                    "add" => "rython_add",
-                    "minus" => "rython_minus",
-                    "multiply" => "rython_multiply",
-                    "divide" => "rython_divide",
-                    "fibonacci" => "rython_fibonacci",
-                    _ => func.as_str(),
-                };
-
-                let function = self.module.get_function(actual_func_name)
-                    .unwrap_or_else(|| panic!("Function '{}' not found in module", actual_func_name));
-                let compiled_args: Vec<inkwell::values::BasicMetadataValueEnum> = args
-                    .iter()
-                    .map(|arg| self.compile_expr(arg).into())
-                    .collect();
-                
-                let call = self.builder.build_call(function, &compiled_args, "calltmp").unwrap();
-                
-                // Handle void functions gracefully
-                if function.get_type().get_return_type().is_none() {
-                    // Return a dummy value (0) for void calls used in expressions
-                    return self.context.i64_type().const_int(0, false).into();
-                }
-
-                let any_val = call.as_any_value_enum();
-                BasicValueEnum::try_from(any_val)
-                    .unwrap_or_else(|_| panic!("Function '{}' should return a basic value but returned {:?}", func, any_val))
+            _ => {
+                // Try manual linking
+                crate::linker::manual_link(&obj_file, output_path)?;
+                fs::remove_file(&obj_file).ok();
+                Ok(())
             }
         }
     }
-
-    pub fn emit_to_file(&self, path: &str) -> Result<(), String> {
-        Target::initialize_native(&InitializationConfig::default()).map_err(|e| e.to_string())?;
-
-        let triple = TargetMachine::get_default_triple();
-        let target = Target::from_triple(&triple).map_err(|e| e.to_string())?;
-        let cpu = TargetMachine::get_host_cpu_name().to_string();
-        let features = TargetMachine::get_host_cpu_features().to_string();
-
-        let target_machine = target
-            .create_target_machine(
-                &triple,
-                &cpu,
-                &features,
-                OptimizationLevel::Default,
-                RelocMode::Default,
-                CodeModel::Default,
-            )
-            .ok_or_else(|| "Failed to create target machine".to_string())?;
-
-        target_machine
-            .write_to_file(&self.module, FileType::Object, Path::new(path))
-            .map_err(|e| e.to_string())
+    
+    fn assemble_windows(&self, asm_file: &str, output_path: &str) -> Result<(), String> {
+        let nasm = crate::utils::find_nasm();
+        let obj_file = format!("{}.obj", output_path);
+        
+        Command::new(&nasm)
+            .arg("-f")
+            .arg("win64")
+            .arg("-o")
+            .arg(&obj_file)
+            .arg(asm_file)
+            .status()
+            .map_err(|e| format!("Failed to run NASM: {}", e))
+            .and_then(|status| {
+                if !status.success() {
+                    return Err("NASM assembly failed".to_string());
+                }
+                Ok(())
+            })?;
+        
+        // Try manual linking first
+        match crate::linker::manual_link(&obj_file, output_path) {
+            Ok(_) => {
+                fs::remove_file(&obj_file).ok();
+                Ok(())
+            }
+            Err(e) => {
+                println!("Manual linking failed: {}", e);
+                // Fallback
+                let result = Command::new("link")
+                    .arg("/subsystem:console")
+                    .arg("/entry:main")
+                    .arg(&obj_file)
+                    .arg(format!("/out:{}", output_path))
+                    .status();
+                
+                result.map_err(|e| format!("Linking failed: {}", e))
+                    .and_then(|status| {
+                        if status.success() {
+                            fs::remove_file(&obj_file).ok();
+                            Ok(())
+                        } else {
+                            Err("All linking attempts failed".to_string())
+                        }
+                    })
+            }
+        }
     }
+}
 
-    pub fn emit_ir_to_string(&self) -> String {
-        self.module.print_to_string().to_string()
-    }
+// ========== PUBLIC API FUNCTIONS ==========
+
+pub fn compile_to_bios(source: &str, output_path: &str) -> Result<(), String> {
+    let config = CompilerConfig {
+        target: Target::BIOS,
+        verbose: true,
+        keep_assembly: true,  // Keep for debugging
+    };
+    
+    let mut compiler = RythonCompiler::new(config);
+    compiler.compile(source, output_path)
+}
+
+pub fn compile_to_linux(source: &str, output_path: &str) -> Result<(), String> {
+    let config = CompilerConfig {
+        target: Target::Linux64,
+        verbose: true,
+        ..Default::default()
+    };
+    
+    let mut compiler = RythonCompiler::new(config);
+    compiler.compile(source, output_path)
+}
+
+pub fn compile_to_windows(source: &str, output_path: &str) -> Result<(), String> {
+    let config = CompilerConfig {
+        target: Target::Windows64,
+        verbose: true,
+        ..Default::default()
+    };
+    
+    let mut compiler = RythonCompiler::new(config);
+    compiler.compile(source, output_path)
+}
+
+pub fn compile_to_bootloader(source_code: &str) -> Result<Vec<u8>, String> {
+    let config = CompilerConfig {
+        target: Target::BIOS,
+        verbose: true,
+        ..Default::default()
+    };
+    
+    let mut compiler = RythonCompiler::new(config);
+    
+    // Parse the source code
+    let program = crate::parser::parse_program(source_code)
+        .map_err(|e| format!("Parse error: {}", e))?;
+    
+    // Create temporary file
+    let temp_file = "temp_boot.bin";
+    compiler.nasm_emitter.set_target_bios();
+    let asm = compiler.nasm_emitter.compile_program(&program);
+    
+    let asm_file = format!("{}.asm", temp_file);
+    fs::write(&asm_file, &asm)
+        .map_err(|e| format!("Failed to write assembly: {}", e))?;
+    
+    compiler.assemble_bios(&asm_file, temp_file)?;
+    
+    // Read binary back
+    let binary = fs::read(temp_file)
+        .map_err(|e| format!("Failed to read binary: {}", e))?;
+    
+    // Clean up
+    fs::remove_file(temp_file).ok();
+    fs::remove_file(&asm_file).ok();
+    
+    Ok(binary)
+}
+
+// Keep the original compile_code function for backward compatibility
+pub fn compile_code<S: AsRef<str>>(source: S, output_path: S) -> Result<(), String> {
+    let source_code = source.as_ref();
+    let output_str = output_path.as_ref();
+    
+    let mut compiler = RythonCompiler::new(CompilerConfig::default());
+    compiler.compile(source_code, output_str)
 }
