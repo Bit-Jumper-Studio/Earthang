@@ -67,6 +67,72 @@ pub enum SIMDRegister {
     K0, K1, K2, K3, K4, K5, K6, K7,  // AVX-512 mask registers
 }
 
+// ========== REGISTER ENUM ==========
+
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum Register {
+    RAX, RBX, RCX, RDX, RSI, RDI, RBP, RSP,
+    R8, R9, R10, R11, R12, R13, R14, R15,
+    EAX, EBX, ECX, EDX, ESI, EDI, EBP, ESP,
+    AX, BX, CX, DX, SI, DI, BP, SP,
+    AL, BL, CL, DL,
+    R8D, R9D, R10D, R11D, R12D, R13D, R14D, R15D,
+}
+
+// ========== OPCODE EMITTER ==========
+
+pub struct OpcodeEmitter;
+
+impl OpcodeEmitter {
+    pub fn new() -> Self {
+        Self
+    }
+    
+    pub fn register_code_64(&self, reg: &Register) -> Result<u8, String> {
+        match reg {
+            Register::RAX => Ok(0),
+            Register::RCX => Ok(1),
+            Register::RDX => Ok(2),
+            Register::RBX => Ok(3),
+            Register::RSP => Ok(4),
+            Register::RBP => Ok(5),
+            Register::RSI => Ok(6),
+            Register::RDI => Ok(7),
+            Register::R8 => Ok(8),
+            Register::R9 => Ok(9),
+            Register::R10 => Ok(10),
+            Register::R11 => Ok(11),
+            Register::R12 => Ok(12),
+            Register::R13 => Ok(13),
+            Register::R14 => Ok(14),
+            Register::R15 => Ok(15),
+            _ => Err(format!("Invalid 64-bit register: {:?}", reg)),
+        }
+    }
+    
+    pub fn register_code_32(&self, reg: &Register) -> Result<u8, String> {
+        match reg {
+            Register::EAX => Ok(0),
+            Register::ECX => Ok(1),
+            Register::EDX => Ok(2),
+            Register::EBX => Ok(3),
+            Register::ESP => Ok(4),
+            Register::EBP => Ok(5),
+            Register::ESI => Ok(6),
+            Register::EDI => Ok(7),
+            Register::R8D => Ok(8),
+            Register::R9D => Ok(9),
+            Register::R10D => Ok(10),
+            Register::R11D => Ok(11),
+            Register::R12D => Ok(12),
+            Register::R13D => Ok(13),
+            Register::R14D => Ok(14),
+            Register::R15D => Ok(15),
+            _ => Err(format!("Invalid 32-bit register: {:?}", reg)),
+        }
+    }
+}
+
 // ========== GRAPHICS EMITTER ==========
 
 pub struct GraphicsEmitter {
@@ -798,6 +864,37 @@ impl GraphicsEmitter {
         bytes.push(0xC0 | (dst_code << 3) | src_code);
         Ok(())
     }
+    
+    // Stub methods that need to be implemented
+    fn emit_avx512_row_fill(&self, _width: u32, _bytes: &mut Vec<u8>) -> Result<(), String> {
+        // TODO: Implement
+        Ok(())
+    }
+    
+    fn emit_avx2_row_fill(&self, _width: u32, _bytes: &mut Vec<u8>) -> Result<(), String> {
+        // TODO: Implement
+        Ok(())
+    }
+    
+    fn emit_sse2_row_fill(&self, _width: u32, _bytes: &mut Vec<u8>) -> Result<(), String> {
+        // TODO: Implement
+        Ok(())
+    }
+    
+    fn emit_scalar_row_fill(&self, _width: u32, _bytes: &mut Vec<u8>) -> Result<(), String> {
+        // TODO: Implement
+        Ok(())
+    }
+    
+    fn emit_avx2_blit(&self, _width: u32, _height: u32, _pitch: u32, _src_addr: u64, _dst_addr: u64, _bytes: &mut Vec<u8>) -> Result<(), String> {
+        // TODO: Implement
+        Ok(())
+    }
+    
+    fn emit_sse2_blit(&self, _width: u32, _height: u32, _pitch: u32, _src_addr: u64, _dst_addr: u64, _bytes: &mut Vec<u8>) -> Result<(), String> {
+        // TODO: Implement
+        Ok(())
+    }
 }
 
 // ========== HIGH-LEVEL GRAPHICS API ==========
@@ -856,7 +953,7 @@ impl GraphicsAPI {
         // Draw circle points
         while x <= y {
             // Draw 8 symmetric points
-            let points = [
+            let _points = [
                 (center_x + x, center_y + y),
                 (center_x - x, center_y + y),
                 (center_x + x, center_y - y),
@@ -867,9 +964,7 @@ impl GraphicsAPI {
                 (center_x - y, center_y - x),
             ];
             
-            for (px, py) in points.iter() {
-                // TODO: Emit pixel drawing for each point
-            }
+            // TODO: Emit pixel drawing for each point
             
             x += 1;
             if d > 0 {

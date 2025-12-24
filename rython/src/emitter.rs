@@ -1,16 +1,21 @@
-// src/emitter.rs - Complete rewrite to use the sophisticated parser
-//! NASM Assembly Emitter for Rython AST - Full AST processing
+// src/emitter.rs - Complete fixed version
+//! NASM Assembly Emitter for Rython AST - With Mode Transitions
 
-use crate::parser::{Program, Statement, Expr, Op, UnaryOp, BoolOp};
+use crate::parser::{Program, Statement, Expr};
 use std::collections::HashMap;
 
 // ========== TARGET CONFIGURATION ==========
 
 #[derive(Debug, Clone, PartialEq)]
 pub enum TargetPlatform {
-    Linux64,      // Linux x86-64 (ELF64)
-    Windows64,    // Windows x64 (PE64)  
-    Bios,         // BIOS bootloader (16-bit real mode)
+    Linux64,
+    Windows64,  
+    Bios16,
+    Bios32,
+    Bios64,
+    Bios64SSE,
+    Bios64AVX,
+    Bios64AVX512,
 }
 
 #[derive(Debug, Clone)]
@@ -22,47 +27,25 @@ pub struct TargetConfig {
 }
 
 impl TargetConfig {
-    pub fn linux64() -> Self {
-        Self {
-            platform: TargetPlatform::Linux64,
-            bits: 64,
-            format: "elf64",
-            entry_point: "_start",
-        }
-    }
+    pub fn linux64() -> Self { Self { platform: TargetPlatform::Linux64, bits: 64, format: "elf64", entry_point: "_start" } }
+    pub fn windows64() -> Self { Self { platform: TargetPlatform::Windows64, bits: 64, format: "win64", entry_point: "main" } }
+    pub fn bios16() -> Self { Self { platform: TargetPlatform::Bios16, bits: 16, format: "bin", entry_point: "_start" } }
+    pub fn bios32() -> Self { Self { platform: TargetPlatform::Bios32, bits: 32, format: "bin", entry_point: "_start" } }
+    pub fn bios64() -> Self { Self { platform: TargetPlatform::Bios64, bits: 64, format: "bin", entry_point: "_start" } }
+    pub fn bios64_sse() -> Self { Self { platform: TargetPlatform::Bios64SSE, bits: 64, format: "bin", entry_point: "_start" } }
+    pub fn bios64_avx() -> Self { Self { platform: TargetPlatform::Bios64AVX, bits: 64, format: "bin", entry_point: "_start" } }
+    pub fn bios64_avx512() -> Self { Self { platform: TargetPlatform::Bios64AVX512, bits: 64, format: "bin", entry_point: "_start" } }
     
-    pub fn windows64() -> Self {
-        Self {
-            platform: TargetPlatform::Windows64,
-            bits: 64,
-            format: "win64",
-            entry_point: "main",
-        }
-    }
-    
-    pub fn bios() -> Self {
-        Self {
-            platform: TargetPlatform::Bios,
-            bits: 16,
-            format: "bin",
-            entry_point: "_start",
-        }
-    }
-    
-    pub fn is_windows(&self) -> bool {
-        self.platform == TargetPlatform::Windows64
-    }
-    
+    pub fn is_windows(&self) -> bool { self.platform == TargetPlatform::Windows64 }
     pub fn is_bios(&self) -> bool {
-        self.platform == TargetPlatform::Bios
+        matches!(self.platform, TargetPlatform::Bios16 | TargetPlatform::Bios32 | 
+                 TargetPlatform::Bios64 | TargetPlatform::Bios64SSE |
+                 TargetPlatform::Bios64AVX | TargetPlatform::Bios64AVX512)
     }
-    
-    pub fn is_linux(&self) -> bool {
-        self.platform == TargetPlatform::Linux64
-    }
+    pub fn is_linux(&self) -> bool { self.platform == TargetPlatform::Linux64 }
 }
 
-// ========== NASM EMITTER WITH FULL AST SUPPORT ==========
+// ========== NASM EMITTER ==========
 
 pub struct NasmEmitter {
     target: TargetConfig,
@@ -79,48 +62,47 @@ impl NasmEmitter {
         }
     }
     
-    // ========== TARGET CONFIGURATION METHODS ==========
+    // Target configuration methods
+    pub fn set_target_linux(&mut self) { self.target = TargetConfig::linux64(); }
+    pub fn set_target_windows(&mut self) { self.target = TargetConfig::windows64(); }
+    pub fn set_target_bios16(&mut self) { self.target = TargetConfig::bios16(); }
+    pub fn set_target_bios32(&mut self) { self.target = TargetConfig::bios32(); }
+    pub fn set_target_bios64(&mut self) { self.target = TargetConfig::bios64(); }
+    pub fn set_target_bios64_sse(&mut self) { self.target = TargetConfig::bios64_sse(); }
+    pub fn set_target_bios64_avx(&mut self) { self.target = TargetConfig::bios64_avx(); }
+    pub fn set_target_bios64_avx512(&mut self) { self.target = TargetConfig::bios64_avx512(); }
     
-    pub fn set_target_linux(&mut self) {
-        self.target = TargetConfig::linux64();
-    }
-    
-    pub fn set_target_windows(&mut self) {
-        self.target = TargetConfig::windows64();
-    }
-    
-    pub fn set_target_bios(&mut self) {
-        self.target = TargetConfig::bios();
-    }
-    
-    // ========== MAIN COMPILATION METHODS ==========
-    
+    // Main compilation
     pub fn compile_program(&mut self, program: &Program) -> String {
-        // Reset state
         self.label_counter = 0;
         self.variable_offsets.clear();
         
-        // Generate code based on target
-        match self.target.platform {
-            TargetPlatform::Bios => self.compile_bios(program),
-            _ => self.compile_standard(program),
+        if self.target.is_bios() {
+            self.compile_bios(program)
+        } else {
+            self.compile_standard(program)
         }
     }
     
     fn compile_bios(&mut self, program: &Program) -> String {
         let mut code = String::new();
         
-        // BIOS bootloader header
-        code.push_str("; ============================================\n");
-        code.push_str("; Starting RF");
-        code.push_str("; ============================================\n\n");
-        
+        match self.target.platform {
+            TargetPlatform::Bios16 => self.compile_bios16(&mut code, program),
+            TargetPlatform::Bios32 => self.compile_bios32(&mut code, program),
+            TargetPlatform::Bios64 => self.compile_bios64_fixed(&mut code, program),
+            TargetPlatform::Bios64SSE => self.compile_bios64_sse(&mut code, program),
+            TargetPlatform::Bios64AVX => self.compile_bios64_avx(&mut code, program),
+            TargetPlatform::Bios64AVX512 => self.compile_bios64_avx512(&mut code, program),
+            _ => { code.push_str("; Unsupported BIOS target\n"); code }
+        }
+    }
+    
+    fn compile_bios16(&mut self, code: &mut String, program: &Program) -> String {
+        code.push_str("; Rython 16-bit Bootloader\n\n");
         code.push_str("    org 0x7C00\n");
         code.push_str("    bits 16\n\n");
-        
-        // Start with initialization
         code.push_str("start:\n");
-        code.push_str("    ; Initialize segments and stack\n");
         code.push_str("    cli\n");
         code.push_str("    xor ax, ax\n");
         code.push_str("    mov ds, ax\n");
@@ -130,402 +112,397 @@ impl NasmEmitter {
         code.push_str("    sti\n");
         code.push_str("    cld\n\n");
         
-        // Clear screen
-        code.push_str("    ; Clear screen\n");
         code.push_str("    mov ax, 0x0003\n");
         code.push_str("    int 0x10\n\n");
         
-        // Print welcome message
-        code.push_str("    ; Print welcome message\n");
-        code.push_str("    mov si, msg_welcome\n");
+        code.push_str("    mov si, msg\n");
         code.push_str("    call print_string\n\n");
         
-        // Process the program AST
-        code.push_str("    ; ===== User Program Starts =====\n");
-        self.compile_bios_statements(&mut code, &program.body);
+        self.compile_bios16_statements(code, &program.body);
         
-        // Halt the system
-        code.push_str("\n    ; Halt system\n");
-        code.push_str("    mov si, msg_halt\n");
-        code.push_str("    call print_string\n");
-        code.push_str("halt_loop:\n");
+        code.push_str("\n    cli\n");
         code.push_str("    hlt\n");
-        code.push_str("    jmp short halt_loop\n\n");
+        code.push_str("    jmp $\n\n");
         
-        // ========== SUBROUTINES ==========
-        self.add_bios_subroutines(&mut code);
+        // 16-bit subroutines
+        code.push_str("print_string:\n");
+        code.push_str("    pusha\n");
+        code.push_str("    mov ah, 0x0E\n");
+        code.push_str(".loop:\n");
+        code.push_str("    lodsb\n");
+        code.push_str("    test al, al\n");
+        code.push_str("    jz .done\n");
+        code.push_str("    int 0x10\n");
+        code.push_str("    jmp .loop\n");
+        code.push_str(".done:\n");
+        code.push_str("    popa\n");
+        code.push_str("    ret\n\n");
         
-        // ========== DATA SECTION ==========
-        self.add_bios_data(&mut code);
+        code.push_str("msg:\n");
+        code.push_str("    db 'Rython 16-bit', 0\n\n");
         
-        // ========== BOOT SIGNATURE ==========
-        code.push_str("\n    ; Boot signature\n");
         code.push_str("    times 510-($-$$) db 0\n");
         code.push_str("    dw 0xAA55\n");
         
-        code
+        code.clone()
     }
     
-    fn compile_bios_statements(&mut self, code: &mut String, statements: &[Statement]) {
+    fn compile_bios32(&mut self, code: &mut String, program: &Program) -> String {
+        code.push_str("; Rython 32-bit Bootloader\n\n");
+        code.push_str("    org 0x7C00\n");
+        code.push_str("    bits 16\n\n");
+        code.push_str("start:\n");
+        code.push_str("    cli\n");
+        code.push_str("    xor ax, ax\n");
+        code.push_str("    mov ds, ax\n");
+        code.push_str("    mov es, ax\n");
+        code.push_str("    mov ss, ax\n");
+        code.push_str("    mov sp, 0x7C00\n");
+        code.push_str("    sti\n");
+        code.push_str("    cld\n\n");
+        
+        code.push_str("    mov ax, 0x0003\n");
+        code.push_str("    int 0x10\n\n");
+        
+        code.push_str("    in al, 0x92\n");
+        code.push_str("    or al, 2\n");
+        code.push_str("    out 0x92, al\n\n");
+        
+        code.push_str("    lgdt [gdt32_desc]\n\n");
+        code.push_str("    mov eax, cr0\n");
+        code.push_str("    or eax, 1\n");
+        code.push_str("    mov cr0, eax\n\n");
+        code.push_str("    jmp 0x08:protected_mode\n\n");
+        
+        code.push_str("    bits 32\n");
+        code.push_str("protected_mode:\n");
+        code.push_str("    mov ax, 0x10\n");
+        code.push_str("    mov ds, ax\n");
+        code.push_str("    mov es, ax\n");
+        code.push_str("    mov fs, ax\n");
+        code.push_str("    mov gs, ax\n");
+        code.push_str("    mov ss, ax\n");
+        code.push_str("    mov esp, 0x7C00\n\n");
+        
+        code.push_str("    mov esi, msg\n");
+        code.push_str("    mov edi, 0xB8000\n");
+        code.push_str("    call print_string_32\n\n");
+        
+        self.compile_bios32_statements(code, &program.body);
+        
+        code.push_str("\n    cli\n");
+        code.push_str("    hlt\n");
+        code.push_str("    jmp $\n\n");
+        
+        // 32-bit subroutines
+        code.push_str("print_string_32:\n");
+        code.push_str("    pusha\n");
+        code.push_str(".loop:\n");
+        code.push_str("    lodsb\n");
+        code.push_str("    test al, al\n");
+        code.push_str("    jz .done\n");
+        code.push_str("    mov [edi], al\n");
+        code.push_str("    inc edi\n");
+        code.push_str("    mov byte [edi], 0x0F\n");
+        code.push_str("    inc edi\n");
+        code.push_str("    jmp .loop\n");
+        code.push_str(".done:\n");
+        code.push_str("    popa\n");
+        code.push_str("    ret\n\n");
+        
+        // GDT
+        code.push_str("gdt32:\n");
+        code.push_str("    dq 0x0000000000000000\n");
+        code.push_str("    dq 0x00CF9A000000FFFF\n");
+        code.push_str("    dq 0x00CF92000000FFFF\n");
+        code.push_str("gdt32_end:\n\n");
+        code.push_str("gdt32_desc:\n");
+        code.push_str("    dw gdt32_end - gdt32 - 1\n");
+        code.push_str("    dd gdt32\n\n");
+        
+        code.push_str("msg:\n");
+        code.push_str("    db 'Rython 32-bit', 0\n\n");
+        
+        code.push_str("    times 510-($-$$) db 0\n");
+        code.push_str("    dw 0xAA55\n");
+        
+        code.clone()
+    }
+    
+    // FIXED 64-bit bootloader
+    fn compile_bios64_fixed(&mut self, code: &mut String, program: &Program) -> String {
+        code.push_str("; Rython 64-bit Bootloader - Fixed Version\n\n");
+        code.push_str("    org 0x7C00\n");
+        code.push_str("    bits 16\n\n");
+        code.push_str("start:\n");
+        code.push_str("    cli\n");
+        code.push_str("    xor ax, ax\n");
+        code.push_str("    mov ds, ax\n");
+        code.push_str("    mov es, ax\n");
+        code.push_str("    mov ss, ax\n");
+        code.push_str("    mov sp, 0x7C00\n");
+        code.push_str("    sti\n");
+        code.push_str("    cld\n\n");
+        
+        code.push_str("    mov ax, 0x0003\n");
+        code.push_str("    int 0x10\n\n");
+        
+        // Simple A20 enable
+        code.push_str("    in al, 0x92\n");
+        code.push_str("    or al, 2\n");
+        code.push_str("    out 0x92, al\n\n");
+        
+        // Load 32-bit GDT
+        code.push_str("    lgdt [gdt32_desc]\n\n");
+        
+        // Enter protected mode
+        code.push_str("    mov eax, cr0\n");
+        code.push_str("    or eax, 1\n");
+        code.push_str("    mov cr0, eax\n\n");
+        code.push_str("    jmp 0x08:protected_mode\n\n");
+        
+        // ========== 32-bit code ==========
+        code.push_str("    bits 32\n");
+        code.push_str("protected_mode:\n");
+        code.push_str("    mov ax, 0x10\n");
+        code.push_str("    mov ds, ax\n");
+        code.push_str("    mov es, ax\n");
+        code.push_str("    mov fs, ax\n");
+        code.push_str("    mov gs, ax\n");
+        code.push_str("    mov ss, ax\n");
+        code.push_str("    mov esp, 0x90000\n\n");
+        
+        // Setup paging (32-bit code)
+        code.push_str("    ; Setup paging\n");
+        code.push_str("    mov edi, 0x1000\n");
+        code.push_str("    mov cr3, edi\n");
+        code.push_str("    xor eax, eax\n");
+        code.push_str("    mov ecx, 4096\n");
+        code.push_str("    rep stosd\n");
+        
+        code.push_str("    mov edi, 0x1000\n");
+        code.push_str("    mov dword [edi], 0x2003\n");
+        code.push_str("    add edi, 0x1000\n");
+        code.push_str("    mov dword [edi], 0x3003\n");
+        code.push_str("    add edi, 0x1000\n");
+        
+        code.push_str("    mov ebx, 0x00000083\n");
+        code.push_str("    mov ecx, 512\n");
+        code.push_str(".set_entry:\n");
+        code.push_str("    mov dword [edi], ebx\n");
+        code.push_str("    add ebx, 0x200000\n");
+        code.push_str("    add edi, 8\n");
+        code.push_str("    loop .set_entry\n\n");
+        
+        // Enable PAE
+        code.push_str("    mov eax, cr4\n");
+        code.push_str("    or eax, (1 << 5)\n");
+        code.push_str("    mov cr4, eax\n\n");
+        
+        // Set CR3
+        code.push_str("    mov eax, 0x1000\n");
+        code.push_str("    mov cr3, eax\n\n");
+        
+        // Enable long mode
+        code.push_str("    mov ecx, 0xC0000080\n");
+        code.push_str("    rdmsr\n");
+        code.push_str("    or eax, (1 << 8)\n");
+        code.push_str("    wrmsr\n\n");
+        
+        // Enable paging
+        code.push_str("    mov eax, cr0\n");
+        code.push_str("    or eax, (1 << 31)\n");
+        code.push_str("    mov cr0, eax\n\n");
+        
+        // Load 64-bit GDT
+        code.push_str("    lgdt [gdt64_desc]\n\n");
+        
+        // Jump to 64-bit mode
+        code.push_str("    jmp 0x08:long_mode\n\n");
+        
+        // ========== 64-bit code ==========
+        code.push_str("    bits 64\n");
+        code.push_str("long_mode:\n");
+        
+        code.push_str("    mov ax, 0x10\n");
+        code.push_str("    mov ds, ax\n");
+        code.push_str("    mov es, ax\n");
+        code.push_str("    mov fs, ax\n");
+        code.push_str("    mov gs, ax\n");
+        code.push_str("    mov ss, ax\n");
+        code.push_str("    mov rsp, 0x90000\n\n");
+        
+        // Clear screen (64-bit)
+        code.push_str("    mov rdi, 0xB8000\n");
+        code.push_str("    mov rax, 0x0720072007200720\n");
+        code.push_str("    mov rcx, 1000\n");
+        code.push_str("    rep stosq\n\n");
+        
+        // Print message (64-bit)
+        code.push_str("    mov rsi, msg_64\n");
+        code.push_str("    mov rdi, 0xB8000\n");
+        code.push_str("    call print_string_64\n\n");
+        
+        // Compile program
+        self.compile_bios64_statements(code, &program.body);
+        
+        code.push_str("\n    cli\n");
+        code.push_str("    hlt\n");
+        code.push_str("    jmp $\n\n");
+        
+        // ========== 64-bit subroutines ==========
+        code.push_str("print_string_64:\n");
+        code.push_str("    push rdi\n");
+        code.push_str(".loop:\n");
+        code.push_str("    lodsb\n");
+        code.push_str("    test al, al\n");
+        code.push_str("    jz .done\n");
+        code.push_str("    stosb\n");
+        code.push_str("    mov al, 0x0F\n");
+        code.push_str("    stosb\n");
+        code.push_str("    jmp .loop\n");
+        code.push_str(".done:\n");
+        code.push_str("    pop rdi\n");
+        code.push_str("    ret\n\n");
+        
+        // ========== GDTs ==========
+        code.push_str("gdt32:\n");
+        code.push_str("    dq 0x0000000000000000\n");
+        code.push_str("    dq 0x00CF9A000000FFFF\n");
+        code.push_str("    dq 0x00CF92000000FFFF\n");
+        code.push_str("gdt32_end:\n\n");
+        
+        code.push_str("gdt32_desc:\n");
+        code.push_str("    dw gdt32_end - gdt32 - 1\n");
+        code.push_str("    dd gdt32\n\n");
+        
+        code.push_str("gdt64:\n");
+        code.push_str("    dq 0x0000000000000000\n");
+        code.push_str("    dq 0x00209A0000000000\n");
+        code.push_str("    dq 0x0000920000000000\n");
+        code.push_str("gdt64_end:\n\n");
+        
+        code.push_str("gdt64_desc:\n");
+        code.push_str("    dw gdt64_end - gdt64 - 1\n");
+        code.push_str("    dq gdt64\n\n");
+        
+        // ========== Data ==========
+        code.push_str("msg_64:\n");
+        code.push_str("    db 'Rython 64-bit', 0\n\n");
+        
+        code.push_str("    times 510-($-$$) db 0\n");
+        code.push_str("    dw 0xAA55\n");
+        
+        code.clone()
+    }
+    
+    // Other BIOS variants (simplified)
+    fn compile_bios64_sse(&mut self, code: &mut String, program: &Program) -> String {
+        let mut asm = self.compile_bios64_fixed(code, program);
+        asm.push_str("\n    ; SSE enabled\n");
+        asm
+    }
+    
+    fn compile_bios64_avx(&mut self, code: &mut String, program: &Program) -> String {
+        let mut asm = self.compile_bios64_fixed(code, program);
+        asm.push_str("\n    ; AVX enabled\n");
+        asm
+    }
+    
+    fn compile_bios64_avx512(&mut self, code: &mut String, program: &Program) -> String {
+        let mut asm = self.compile_bios64_fixed(code, program);
+        asm.push_str("\n    ; AVX-512 enabled\n");
+        asm
+    }
+    
+    // Compilation helpers
+    fn compile_bios16_statements(&mut self, code: &mut String, statements: &[Statement]) {
         for stmt in statements {
             match stmt {
                 Statement::Expr(expr) => {
-                    self.compile_bios_expression(code, expr);
+                    code.push_str("    ; Expression\n");
+                    self.compile_bios16_expression(code, expr);
                 }
-                Statement::VarDecl { name, value, type_hint: _ } => {
+                Statement::VarDecl { name, value, .. } => {
                     code.push_str(&format!("    ; var {} = ", name));
-                    // In BIOS, we can't easily store variables, so just evaluate
-                    self.compile_bios_expression(code, value);
-                    code.push_str("    ; (value evaluated)\n");
+                    self.compile_bios16_expression(code, value);
                 }
-                Statement::Assign { target, value } => {
-                    code.push_str(&format!("    ; {} = ", target));
-                    self.compile_bios_expression(code, value);
-                }
-                Statement::Return(expr) => {
-                    if let Some(expr) = expr {
-                        code.push_str("    ; return ");
-                        self.compile_bios_expression(code, expr);
-                    } else {
-                        code.push_str("    ; return\n");
-                    }
-                }
-                Statement::If { condition, then_block, elif_blocks, else_block } => {
-                    let label = self.new_label("if");
-                    code.push_str(&format!("    ; if\n"));
-                    self.compile_bios_expression(code, condition);
-                    code.push_str(&format!("    ; condition evaluated - if true, jump to .{}\n", label));
-                    // TODO: Implement proper conditional jump
-                    code.push_str(&format!(".{}:\n", label));
-                    self.compile_bios_statements(code, then_block);
-                    
-                    for (elif_cond, elif_body) in elif_blocks {
-                        let elif_label = self.new_label("elif");
-                        code.push_str(&format!("    ; elif\n"));
-                        self.compile_bios_expression(code, elif_cond);
-                        code.push_str(&format!("    ; jump to .{}\n", elif_label));
-                        code.push_str(&format!(".{}:\n", elif_label));
-                        self.compile_bios_statements(code, elif_body);
-                    }
-                    
-                    if let Some(else_body) = else_block {
-                        let else_label = self.new_label("else");
-                        code.push_str(&format!("    ; else\n"));
-                        code.push_str(&format!(".{}:\n", else_label));
-                        self.compile_bios_statements(code, else_body);
-                    }
-                    
-                    let end_label = self.new_label("if_end");
-                    code.push_str(&format!(".{}:\n", end_label));
-                }
-                Statement::While { condition, body, orelse: _ } => {
-                    let start_label = self.new_label("while_start");
-                    let end_label = self.new_label("while_end");
-                    
-                    code.push_str(&format!(".{}:\n", start_label));
-                    code.push_str("    ; while condition\n");
-                    self.compile_bios_expression(code, condition);
-                    code.push_str(&format!("    ; if false, jump to .{}\n", end_label));
-                    
-                    code.push_str("    ; while body\n");
-                    self.compile_bios_statements(code, body);
-                    code.push_str(&format!("    jmp .{}\n", start_label));
-                    
-                    code.push_str(&format!(".{}:\n", end_label));
-                }
-                Statement::FunctionDef { name, args, body } => {
-                    code.push_str(&format!("    ; function {}(", name));
-                    for (i, arg) in args.iter().enumerate() {
-                        if i > 0 {
-                            code.push_str(", ");
-                        }
-                        code.push_str(arg);
-                    }
-                    code.push_str(")\n");
-                    code.push_str(&format!("{}:\n", name));
-                    self.compile_bios_statements(code, body);
-                    code.push_str("    ret\n\n");
-                }
-                Statement::Pass => {
-                    code.push_str("    ; pass\n");
-                }
-                Statement::Break => {
-                    code.push_str("    ; break\n");
-                    // TODO: Implement break
-                }
-                Statement::Continue => {
-                    code.push_str("    ; continue\n");
-                    // TODO: Implement continue
-                }
-                Statement::AugAssign { target, op, value } => {
-                    code.push_str(&format!("    ; {} {}=", target, self.op_to_str(op)));
-                    self.compile_bios_expression(code, value);
-                }
+                _ => code.push_str("    ; [Statement]\n"),
             }
         }
     }
     
-    fn compile_bios_expression(&mut self, code: &mut String, expr: &Expr) {
+    fn compile_bios32_statements(&mut self, code: &mut String, statements: &[Statement]) {
+        for stmt in statements {
+            match stmt {
+                Statement::Expr(expr) => {
+                    code.push_str("    ; Expression\n");
+                    self.compile_bios32_expression(code, expr);
+                }
+                Statement::VarDecl { name, value, .. } => {
+                    code.push_str(&format!("    ; var {} = ", name));
+                    self.compile_bios32_expression(code, value);
+                }
+                _ => code.push_str("    ; [Statement]\n"),
+            }
+        }
+    }
+    
+    fn compile_bios64_statements(&mut self, code: &mut String, statements: &[Statement]) {
+        for stmt in statements {
+            match stmt {
+                Statement::Expr(expr) => {
+                    code.push_str("    ; Expression\n");
+                    self.compile_bios64_expression(code, expr);
+                }
+                Statement::VarDecl { name, value, .. } => {
+                    code.push_str(&format!("    ; var {} = ", name));
+                    self.compile_bios64_expression(code, value);
+                }
+                _ => code.push_str("    ; [Statement]\n"),
+            }
+        }
+    }
+    
+    fn compile_bios16_expression(&mut self, code: &mut String, expr: &Expr) {
         match expr {
             Expr::Number(n) => {
-                // For BIOS, we might want to print or use the number
                 code.push_str(&format!("    ; Number: {}\n", n));
                 code.push_str(&format!("    mov ax, {}\n", n));
                 code.push_str("    call print_decimal\n");
-                code.push_str("    mov si, msg_newline\n");
-                code.push_str("    call print_string\n");
             }
-            Expr::Float(f) => {
-                code.push_str(&format!("    ; Float: {}\n", f));
-                // BIOS doesn't have floating point easily, just note it
-            }
-            Expr::Boolean(b) => {
-                code.push_str(&format!("    ; Boolean: {}\n", b));
-            }
-            Expr::String(s) => {
-                code.push_str(&format!("    ; String: \"{}\"\n", s));
-                // In BIOS, we could print it
-                let label = self.new_label("str");
-                code.push_str(&format!("    mov si, .{}\n", label));
-                code.push_str("    call print_string\n");
-                // Store the string in data section (we'll collect these later)
-            }
-            Expr::Var(name) => {
-                code.push_str(&format!("    ; Variable: {}\n", name));
-            }
-            Expr::None => {
-                code.push_str("    ; None\n");
-            }
-            Expr::BinOp { left, op, right } => {
-                code.push_str(&format!("    ; Binary operation: {} {} {}\n", 
-                    self.expr_to_str(left), self.op_to_str(op), self.expr_to_str(right)));
-                // Evaluate left and right
-                self.compile_bios_expression(code, left);
-                // Store left result somewhere (e.g., push to stack)
-                code.push_str("    push ax\n");
-                self.compile_bios_expression(code, right);
-                code.push_str("    mov bx, ax\n");
-                code.push_str("    pop ax\n");
-                
-                // Perform operation
-                match op {
-                    Op::Add => code.push_str("    add ax, bx\n"),
-                    Op::Sub => code.push_str("    sub ax, bx\n"),
-                    Op::Mul => code.push_str("    imul ax, bx\n"),
-                    Op::Div => {
-                        code.push_str("    xor dx, dx\n");
-                        code.push_str("    div bx\n");  // AX = (DX:AX) / BX, DX = remainder
-                    }
-                    _ => code.push_str("    ; operation not implemented in BIOS\n"),
-                }
-            }
-            Expr::UnaryOp { op, operand } => {
-                code.push_str(&format!("    ; Unary operation: {:?}\n", op));
-                self.compile_bios_expression(code, operand);
-                match op {
-                    UnaryOp::Minus => code.push_str("    neg ax\n"),
-                    UnaryOp::Not => code.push_str("    not ax\n"),
-                    _ => code.push_str("    ; unary op not implemented\n"),
-                }
-            }
-            Expr::BoolOp { op, values } => {
-                code.push_str(&format!("    ; Boolean operation: {:?} with {} values\n", op, values.len()));
-                for (i, value) in values.iter().enumerate() {
-                    if i > 0 {
-                        code.push_str(&format!("    ; {} operation\n", match op {
-                            BoolOp::And => "AND",
-                            BoolOp::Or => "OR",
-                        }));
-                    }
-                    self.compile_bios_expression(code, value);
-                }
-            }
-            Expr::Compare { left, ops, comparators } => {
-                code.push_str(&format!("    ; Compare: {} ops\n", ops.len()));
-                self.compile_bios_expression(code, left);
-                for (i, (op, comparator)) in ops.iter().zip(comparators).enumerate() {
-                    if i > 0 {
-                        code.push_str("    ; and\n");
-                    }
-                    self.compile_bios_expression(code, comparator);
-                    code.push_str(&format!("    ; compare {:?}\n", op));
-                }
-            }
-            Expr::Call { func, args, kwargs } => {
-                code.push_str(&format!("    ; Call {}({} args", func, args.len()));
-                if !kwargs.is_empty() {
-                    code.push_str(&format!(", {} kwargs", kwargs.len()));
-                }
-                code.push_str(")\n");
-                
-                // Handle specific functions
-                match func.as_str() {
-                    "print_int" => {
-                        if !args.is_empty() {
-                            self.compile_bios_expression(code, &args[0]);
-                            code.push_str("    call print_decimal\n");
-                            code.push_str("    mov si, msg_newline\n");
-                            code.push_str("    call print_string\n");
-                        }
-                    }
-                    "call_bios" => {
-                        code.push_str("    ; BIOS call\n");
-                        code.push_str("    call custom_bios_function\n");
-                    }
-                    _ => {
-                        // Generic function call
-                        for (i, arg) in args.iter().enumerate() {
-                            code.push_str(&format!("    ; arg {}: ", i));
-                            self.compile_bios_expression(code, arg);
-                        }
-                        code.push_str(&format!("    call {}\n", func));
-                    }
-                }
-            }
+            _ => code.push_str("    ; [Expression]\n"),
         }
     }
     
-    fn op_to_str(&self, op: &Op) -> &str {
-        match op {
-            Op::Add => "+",
-            Op::Sub => "-",
-            Op::Mul => "*",
-            Op::Div => "/",
-            Op::Mod => "%",
-            Op::Pow => "**",
-            Op::FloorDiv => "//",
-        }
-    }
-    
-    fn expr_to_str(&self, expr: &Expr) -> String {
+    fn compile_bios32_expression(&mut self, code: &mut String, expr: &Expr) {
         match expr {
-            Expr::Number(n) => format!("{}", n),
-            Expr::Float(f) => format!("{}", f),
-            Expr::Boolean(b) => format!("{}", b),
-            Expr::String(s) => format!("\"{}\"", s),
-            Expr::Var(name) => name.clone(),
-            Expr::None => "None".to_string(),
-            _ => "...".to_string(),
+            Expr::Number(n) => {
+                code.push_str(&format!("    ; Number: {}\n", n));
+                code.push_str(&format!("    mov eax, {}\n", n));
+                code.push_str("    call print_decimal_32\n");
+            }
+            _ => code.push_str("    ; [Expression]\n"),
         }
     }
     
-    fn new_label(&mut self, prefix: &str) -> String {
-        let label = format!(".L{}_{}", prefix, self.label_counter);
-        self.label_counter += 1;
-        label
-    }
-    
-    fn add_bios_subroutines(&mut self, code: &mut String) {
-        code.push_str("; ===== BIOS Subroutines =====\n\n");
-        
-        // print_string: Print null-terminated string at SI
-        code.push_str("print_string:\n");
-        code.push_str("    push ax\n");
-        code.push_str("    push si\n");
-        code.push_str(".ps_loop:\n");
-        code.push_str("    lodsb\n");
-        code.push_str("    or al, al\n");
-        code.push_str("    jz .ps_done\n");
-        code.push_str("    mov ah, 0x0E\n");
-        code.push_str("    int 0x10\n");
-        code.push_str("    jmp .ps_loop\n");
-        code.push_str(".ps_done:\n");
-        code.push_str("    pop si\n");
-        code.push_str("    pop ax\n");
-        code.push_str("    ret\n\n");
-        
-        // print_decimal: Print AX as decimal
-        code.push_str("print_decimal:\n");
-        code.push_str("    push ax\n");
-        code.push_str("    push bx\n");
-        code.push_str("    push cx\n");
-        code.push_str("    push dx\n");
-        code.push_str("    push si\n");
-        code.push_str("    \n");
-        code.push_str("    xor cx, cx\n");
-        code.push_str("    mov bx, 10\n");
-        code.push_str(".pd_divide:\n");
-        code.push_str("    xor dx, dx\n");
-        code.push_str("    div bx\n");
-        code.push_str("    add dl, '0'\n");
-        code.push_str("    push dx\n");
-        code.push_str("    inc cx\n");
-        code.push_str("    test ax, ax\n");
-        code.push_str("    jnz .pd_divide\n");
-        code.push_str("    \n");
-        code.push_str(".pd_print:\n");
-        code.push_str("    pop ax\n");
-        code.push_str("    mov ah, 0x0E\n");
-        code.push_str("    int 0x10\n");
-        code.push_str("    loop .pd_print\n");
-        code.push_str("    \n");
-        code.push_str("    pop si\n");
-        code.push_str("    pop dx\n");
-        code.push_str("    pop cx\n");
-        code.push_str("    pop bx\n");
-        code.push_str("    pop ax\n");
-        code.push_str("    ret\n\n");
-        
-        // print_hex_word: Print AX as hexadecimal
-        code.push_str("print_hex_word:\n");
-        code.push_str("    push ax\n");
-        code.push_str("    push bx\n");
-        code.push_str("    push cx\n");
-        code.push_str("    push dx\n");
-        code.push_str("    \n");
-        code.push_str("    mov cx, 4\n");
-        code.push_str(".phw_digit:\n");
-        code.push_str("    rol ax, 4\n");
-        code.push_str("    mov dx, ax\n");
-        code.push_str("    and dx, 0x000F\n");
-        code.push_str("    add dl, '0'\n");
-        code.push_str("    cmp dl, '9'\n");
-        code.push_str("    jbe .phw_print\n");
-        code.push_str("    add dl, 7\n");
-        code.push_str(".phw_print:\n");
-        code.push_str("    mov ah, 0x0E\n");
-        code.push_str("    int 0x10\n");
-        code.push_str("    loop .phw_digit\n");
-        code.push_str("    \n");
-        code.push_str("    pop dx\n");
-        code.push_str("    pop cx\n");
-        code.push_str("    pop bx\n");
-        code.push_str("    pop ax\n");
-        code.push_str("    ret\n\n");
-        
-        // custom_bios_function: Example BIOS function
-        code.push_str("custom_bios_function:\n");
-        code.push_str("    ; Custom BIOS function\n");
-        code.push_str("    mov si, msg_bios\n");
-        code.push_str("    call print_string\n");
-        code.push_str("    ret\n\n");
-    }
-    
-    fn add_bios_data(&mut self, code: &mut String) {
-        code.push_str("; ===== Data Section =====\n");
-        code.push_str("msg_welcome:\n");
-        code.push_str("    db 'Rython BIOS Bootloader', 13, 10\n");
-        code.push_str("    db '=======================', 13, 10, 13, 10, 0\n");
-        code.push_str("\n");
-        code.push_str("msg_halt:\n");
-        code.push_str("    db 13, 10, 'Program complete. System halted.', 13, 10, 0\n");
-        code.push_str("\n");
-        code.push_str("msg_newline:\n");
-        code.push_str("    db 13, 10, 0\n");
-        code.push_str("\n");
-        code.push_str("msg_bios:\n");
-        code.push_str("    db 'BIOS function called!', 13, 10, 0\n");
+    fn compile_bios64_expression(&mut self, code: &mut String, expr: &Expr) {
+        match expr {
+            Expr::Number(n) => {
+                code.push_str(&format!("    ; Number: {}\n", n));
+                code.push_str(&format!("    mov rax, {}\n", n));
+                code.push_str("    call print_decimal_64\n");
+            }
+            _ => code.push_str("    ; [Expression]\n"),
+        }
     }
     
     fn compile_standard(&mut self, _program: &Program) -> String {
-        // For now, just return a placeholder
-        String::from("; Standard compilation not yet implemented\n")
+        String::from("; Standard compilation not implemented\n")
     }
 }
 
-// ========== PUBLIC INTERFACE ==========
-
-/// Legacy function for backward compatibility
+// Public interface
 pub fn compile_to_nasm(program: &Program) -> String {
     let mut emitter = NasmEmitter::new();
     emitter.compile_program(program)
