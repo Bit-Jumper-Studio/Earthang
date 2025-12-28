@@ -1,11 +1,10 @@
-// ==================== RCL INTEGRATION WITH RYTHON COMPILER ====================
-
 use std::path::Path;
-use crate::parser::{Program, Statement, Expr};
+use std::fs;
+use crate::parser::parse_program;
 use crate::compiler::{RythonCompiler, CompilerConfig, Target};
-use crate::emitter::NasmEmitter;
-use crate::backend::{Backend, BackendRegistry, Bios64Backend, BackendModule, Capability};
-use super::rcl_compiler::{RclCompiler, RclImportManager, RclLibrary, RclEntry};
+use crate::modules::ModuleRegistry;
+use crate::rcl_compiler::{RclImportManager, RclCompiler, create_test_library};
+use serde_json;
 
 /// Extended Rython compiler with RCL support
 pub struct RythonCompilerWithRcl {
@@ -13,6 +12,7 @@ pub struct RythonCompilerWithRcl {
     rcl_manager: RclImportManager,
     rcl_mode: bool,
     include_rcl_assembly: bool,
+    module_registry: ModuleRegistry,
 }
 
 impl RythonCompilerWithRcl {
@@ -22,6 +22,7 @@ impl RythonCompilerWithRcl {
             rcl_manager: RclImportManager::new(),
             rcl_mode: false,
             include_rcl_assembly: true,
+            module_registry: ModuleRegistry::default_registry(),
         }
     }
     
@@ -35,236 +36,160 @@ impl RythonCompilerWithRcl {
         self.include_rcl_assembly = false;
     }
     
-    /// Add RCL import path
-    pub fn add_rcl_path(&mut self, path: &str) {
-        self.rcl_manager.add_import_path(path);
-    }
-    
-    /// Pre-load RCL libraries
-    pub fn preload_libraries(&mut self, libraries: &[&str]) -> Result<(), String> {
-        for lib in libraries {
-            self.rcl_manager.import_library(lib)?;
-        }
-        Ok(())
-    }
-    
-    /// Compile Rython code with RCL support
+    /// Compile with RCL support (now includes module conversion to RCL)
     pub fn compile_with_rcl(&mut self, source: &str, output_path: &str) -> Result<(), String> {
-        println!("[RCL] Compiling with RCL support...");
+        if self.base_config.verbose {
+            println!("[RCL] Compiling with RCL support...");
+        }
         
-        // 1. Parse source code
-        let program = crate::parser::parse_program(source)
+        // Parse source
+        let program = parse_program(source)
             .map_err(|e| format!("Parse error: {}", e))?;
         
-        // 2. Extract and process imports
-        let (program_without_imports, imported_libs) = self.extract_imports(&program)?;
+        // Extract required modules
+        let required_modules = self.module_registry.extract_required_modules(&program);
         
-        // 3. Load imported libraries
-        for lib_name in &imported_libs {
-            self.rcl_manager.import_library(lib_name)?;
+        if !required_modules.is_empty() && self.base_config.verbose {
+            println!("[RCL] Detected modules: {:?}", required_modules);
         }
         
-        // 4. Select backend
-        let module = self.create_backend_module(&program_without_imports)?;
-        let mut backend = self.select_backend(&module)?;
-        
-        // 5. Generate base assembly
-        let mut asm = backend.compile_program(&program_without_imports)
-            .map_err(|e| format!("Backend failed: {}", e))?;
-        
-        // 6. Append RCL assembly if needed
-        if self.include_rcl_assembly {
-            asm = self.append_rcl_assembly(asm);
+        // Create RCL libraries for modules if in RCL mode
+        if self.rcl_mode {
+            for module_name in &required_modules {
+                if let Some(module) = self.module_registry.get_module(module_name) {
+                    let rcl_lib = module.to_rcl_library(&self.base_config.target.to_string());
+                    let json = serde_json::to_string_pretty(&rcl_lib)
+                        .map_err(|e| format!("Failed to serialize RCL: {}", e))?;
+                    
+                    let rcl_file = format!("{}.rcl", module_name);
+                    fs::write(&rcl_file, &json)
+                        .map_err(|e| format!("Failed to write RCL file: {}", e))?;
+                    
+                    if self.base_config.verbose {
+                        println!("[RCL] Created RCL library: {}", rcl_file);
+                    }
+                    
+                    // Import the generated RCL
+                    self.rcl_manager.import_library(&rcl_file)?;
+                }
+            }
         }
         
-        // 7. Write and assemble
-        let asm_file = format!("{}.asm", output_path);
-        std::fs::write(&asm_file, &asm)
-            .map_err(|e| format!("Failed to write assembly: {}", e))?;
+        // Use base compiler for the main compilation
+        let mut base_compiler = RythonCompiler::new(self.base_config.clone());
         
-        // 8. Assemble based on target
-        self.assemble_based_on_target(&asm_file, output_path)?;
+        // Pass the required modules to the base compiler
+        base_compiler.config_mut().modules = required_modules.clone();
         
-        // 9. Cleanup
-        if !self.base_config.keep_assembly {
-            std::fs::remove_file(&asm_file)
-                .map_err(|e| format!("Failed to remove assembly file: {}", e))?;
+        // Compile the main program
+        base_compiler.compile(source, output_path)?;
+
+        // If RCL mode is enabled and we have RCL assembly to include
+        if self.rcl_mode && self.include_rcl_assembly {
+            let extra_asm = self.generate_rcl_assembly();
+            if !extra_asm.is_empty() {
+                // Append RCL assembly to the binary
+                self.append_rcl_to_binary(output_path, &extra_asm)?;
+                    
+                if self.base_config.verbose {
+                    println!("[RCL] Added RCL assembly to binary");
+                }
+            }
         }
-        
-        println!("[RCL] Compilation successful!");
+
+        if self.base_config.verbose {
+            println!("[RCL] Compilation successful!");
+        }
         Ok(())
     }
-    
-    fn extract_imports(&self, program: &Program) -> Result<(Program, Vec<String>), String> {
-        let mut filtered_statements = Vec::new();
-        let mut imported_libs = Vec::new();
+
+    /// Append RCL assembly to binary as a data section
+    fn append_rcl_to_binary(&self, output_path: &str, assembly: &str) -> Result<(), String> {
+        // Read the original binary
+        let mut binary = fs::read(output_path)
+            .map_err(|e| format!("Failed to read binary: {}", e))?;
         
-        for stmt in &program.body {
-            match stmt {
-                Statement::Expr(Expr::Call { func, args, .. }) if func == "import" => {
-                    if let Some(Expr::String(lib_name)) = args.get(0) {
-                        imported_libs.push(lib_name.clone());
-                    }
-                }
-                Statement::Expr(Expr::Call { func, args, .. }) if func == "from" => {
-                    if let (Some(Expr::String(lib_name)), Some(Expr::Call { func: import_func, args: import_args, .. })) = 
-                        (args.get(0), args.get(1)) {
-                        if import_func == "import" {
-                            if let Some(Expr::String(_symbol)) = import_args.get(0) {
-                                imported_libs.push(lib_name.clone());
-                                // Store the symbol for later use
-                            }
-                        }
-                    }
-                }
-                _ => {
-                    filtered_statements.push(stmt.clone());
-                }
-            }
-        }
-        
-        Ok((Program { body: filtered_statements }, imported_libs))
-    }
-    
-    fn create_backend_module(&self, _program: &Program) -> Result<BackendModule, String> {
-        // Create a simple module with required capabilities
-        let mut required_capabilities = Vec::new();
-        
-        match self.base_config.target {
-            Target::Bios16 => {
-                required_capabilities.push(Capability::BIOS);
-                required_capabilities.push(Capability::RealMode16);
-            }
-            Target::Bios32 => {
-                required_capabilities.push(Capability::BIOS);
-                required_capabilities.push(Capability::ProtectedMode32);
-            }
-            Target::Bios64 => {
-                required_capabilities.push(Capability::BIOS);
-                required_capabilities.push(Capability::LongMode64);
-            }
-            Target::Bios64Sse => {
-                required_capabilities.push(Capability::BIOS);
-                required_capabilities.push(Capability::LongMode64);
-                required_capabilities.push(Capability::SSE);
-            }
-            Target::Bios64Avx => {
-                required_capabilities.push(Capability::BIOS);
-                required_capabilities.push(Capability::LongMode64);
-                required_capabilities.push(Capability::AVX);
-            }
-            Target::Bios64Avx512 => {
-                required_capabilities.push(Capability::BIOS);
-                required_capabilities.push(Capability::LongMode64);
-                required_capabilities.push(Capability::AVX512);
-            }
-            Target::Linux64 => {
-                required_capabilities.push(Capability::Linux);
-                required_capabilities.push(Capability::LongMode64);
-            }
-            Target::Windows64 => {
-                required_capabilities.push(Capability::Windows);
-                required_capabilities.push(Capability::LongMode64);
-            }
-        }
-        
-        Ok(BackendModule {
-            functions: Vec::new(),
-            globals: Vec::new(),
-            required_capabilities,
-        })
-    }
-    
-    fn select_backend(&self, module: &BackendModule) -> Result<Box<dyn Backend>, String> {
-        let registry = BackendRegistry::default_registry();
-        
-        // Find compatible backend
-        for backend in &registry.backends {
-            if backend.can_compile(module) {
-                match backend.name() {
-                    "bios64" => {
-                        let mut bios_backend = Bios64Backend::new();
-                        
-                        // Enable extensions if requested
-                        if module.required_capabilities.contains(&Capability::SSE) {
-                            bios_backend = bios_backend.with_sse();
-                        }
-                        if module.required_capabilities.contains(&Capability::AVX) {
-                            bios_backend = bios_backend.with_avx();
-                        }
-                        
-                        return Ok(Box::new(bios_backend));
-                    }
-                    _ => continue,
-                }
-            }
-        }
-        
-        Err("No compatible backend found".to_string())
-    }
-    
-    fn append_rcl_assembly(&self, base_asm: String) -> String {
-        let mut final_asm = base_asm;
-        
-        // Get all loaded libraries
-        let libraries = self.rcl_manager.get_loaded_libraries();
-        
-        if !libraries.is_empty() {
-            final_asm.push_str("\n; ========== RCL LIBRARIES ==========\n\n");
-            
-            for library in libraries {
-                // Only include libraries for current target
-                let target_str = match self.base_config.target {
-                    Target::Bios16 => "bios16",
-                    Target::Bios32 => "bios32",
-                    Target::Bios64 => "bios64",
-                    Target::Bios64Sse => "bios64",
-                    Target::Bios64Avx => "bios64",
-                    Target::Bios64Avx512 => "bios64",
-                    Target::Linux64 => "linux64",
-                    Target::Windows64 => "windows64",
-                };
-                
-                if library.metadata.target == target_str {
-                    final_asm.push_str(&format!("; Library: {}\n", library.metadata.name));
-                    
-                    for entry in &library.entries {
-                        match entry {
-                            RclEntry::Function(func) => {
-                                if let Some(asm_code) = &func.assembly {
-                                    final_asm.push_str(asm_code);
-                                    final_asm.push_str("\n");
-                                }
-                            }
-                            RclEntry::Assembly(asm_entry) if asm_entry.target == target_str => {
-                                final_asm.push_str(&asm_entry.code);
-                                final_asm.push_str("\n");
-                            }
-                            _ => {}
-                        }
-                    }
-                }
-            }
-        }
-        
-        final_asm
-    }
-    
-    fn assemble_based_on_target(&self, asm_file: &str, output_path: &str) -> Result<(), String> {
-        // Use existing compiler for assembly
-        let base_compiler = RythonCompiler::new(self.base_config.clone());
-        
-        match self.base_config.target {
+        // For BIOS targets, append as data after boot sector
+        if matches!(self.base_config.target, 
             Target::Bios16 | Target::Bios32 | Target::Bios64 | 
-            Target::Bios64Sse | Target::Bios64Avx | Target::Bios64Avx512 => 
-                base_compiler.assemble_bios(asm_file, output_path),
-            Target::Linux64 => base_compiler.assemble_linux(asm_file, output_path),
-            Target::Windows64 => base_compiler.assemble_windows(asm_file, output_path),
+            Target::Bios64Sse | Target::Bios64Avx | Target::Bios64Avx512) {
+            
+            // Ensure we're not overwriting boot signature
+            if binary.len() >= 510 {
+                // Pad to 510 bytes if needed
+                while binary.len() < 510 {
+                    binary.push(0);
+                }
+                // Keep boot signature
+                if binary.len() == 510 {
+                    binary.push(0x55);
+                    binary.push(0xAA);
+                }
+                
+                // Append RCL data
+                binary.extend(b"RCL_DATA");
+                binary.extend(assembly.as_bytes());
+            }
+        } else {
+            // For other targets, just append
+            binary.extend(b"RCL_DATA");
+            binary.extend(assembly.as_bytes());
         }
+        
+        // Write back
+        fs::write(output_path, binary)
+            .map_err(|e| format!("Failed to write final binary: {}", e))
+    }
+
+    /// Generate assembly from all loaded RCL libraries
+    fn generate_rcl_assembly(&self) -> String {
+        use crate::rcl_compiler::RclEntry;
+        
+        let mut asm = String::new();
+        for lib in self.rcl_manager.get_loaded_libraries() {
+            asm.push_str(&format!("; RCL Library: {}\n", lib.metadata.name));
+            for entry in &lib.entries {
+                match entry {
+                    RclEntry::Assembly(assm) => {
+                        asm.push_str(&assm.code);
+                        asm.push_str("\n");
+                    }
+                    RclEntry::Function(func) => {
+                        if let Some(func_asm) = &func.assembly {
+                            asm.push_str(&format!("; Function from RCL: {}\n", func.name));
+                            asm.push_str(func_asm);
+                            asm.push_str("\n");
+                        }
+                    }
+                    _ => {}
+                }
+            }
+        }
+        asm
     }
 }
 
-/// Command-line interface for RCL operations
+/// Public API functions for RCL
+pub fn compile_with_rcl(source: &str, output_path: &str, target: Target) -> Result<(), String> {
+    let config = CompilerConfig {
+        target,
+        verbose: true,
+        keep_assembly: true,
+        optimize: true,
+        modules: Vec::new(),
+    };
+    
+    let mut compiler = RythonCompilerWithRcl::new(config);
+    compiler.enable_rcl();
+    compiler.compile_with_rcl(source, output_path)
+}
+
+pub fn create_rcl_library(source: &str, output_file: &str, target: &str) -> Result<(), String> {
+    let cli = RclCli::new(true);
+    cli.compile_to_rcl(source, output_file, target)
+}
+
+// Command-line interface for RCL operations
 pub struct RclCli {
     pub verbose: bool,
 }
@@ -285,7 +210,7 @@ impl RclCli {
             .map_err(|e| format!("Failed to read source: {}", e))?;
         
         // Parse
-        let program = crate::parser::parse_program(&source)
+        let program = parse_program(&source)
             .map_err(|e| format!("Parse error: {}", e))?;
         
         // Extract library name from filename
@@ -295,13 +220,9 @@ impl RclCli {
             .unwrap_or("library")
             .to_string();
         
-        // Create RCL compiler
+        // Create RCL compiler with real compilation
         let mut rcl_compiler = RclCompiler::new(&lib_name, target);
-        rcl_compiler.export_all();
-        
-        // Compile to RCL
         rcl_compiler.compile_program(&program)?;
-        rcl_compiler.finalize()?;
         
         // Save to file
         rcl_compiler.save_to_file(output_file)?;
@@ -320,6 +241,8 @@ impl RclCli {
     
     /// Display RCL library info
     pub fn show_rcl_info(&self, rcl_file: &str) -> Result<(), String> {
+        use crate::rcl_compiler::RclEntry;
+        
         let library = RclCompiler::load_from_file(rcl_file)?;
         
         println!("╔══════════════════════════════════════════════╗");
@@ -343,9 +266,7 @@ impl RclCli {
         
         if !library.metadata.exports.is_empty() && self.verbose {
             for export in &library.metadata.exports {
-                if let Some(entry_type) = library.symbol_table.get(export) {
-                    println!("║   • {} ({})", export, entry_type);
-                }
+                println!("║   • {}", export);
             }
         }
         
@@ -393,6 +314,8 @@ impl RclCli {
     
     /// Extract assembly from RCL library
     pub fn extract_assembly(&self, rcl_file: &str, function_name: &str) -> Result<(), String> {
+        use crate::rcl_compiler::RclEntry;
+        
         let library = RclCompiler::load_from_file(rcl_file)?;
         
         // Find the function
@@ -419,14 +342,18 @@ impl RclCli {
     
     /// List all functions in RCL library
     pub fn list_functions(&self, rcl_file: &str) -> Result<(), String> {
+        use crate::rcl_compiler::RclEntry;
+        
         let library = RclCompiler::load_from_file(rcl_file)?;
         
         println!("Functions in {}:", library.metadata.name);
         println!("{:<20} {:<10} {:<8} {:<6}", "Name", "Params", "Inline", "Pure");
         println!("{:-<60}", "");
         
+        let mut functions_found = false;
         for entry in &library.entries {
             if let RclEntry::Function(func) = entry {
+                functions_found = true;
                 let param_count = func.parameters.len();
                 println!("{:<20} {:<10} {:<8} {:<6}", 
                     func.name, 
@@ -436,77 +363,24 @@ impl RclCli {
             }
         }
         
-        Ok(())
-    }
-    
-    /// Create a test RCL library
-    pub fn create_test_library(&self, output_file: &str) -> Result<(), String> {
-        let test_lib = super::rcl_compiler::create_test_library();
-        
-        let rcl_text = serde_json::to_string_pretty(&test_lib)
-            .map_err(|e| format!("Failed to serialize: {}", e))?;
-        
-        std::fs::write(output_file, rcl_text)
-            .map_err(|e| format!("Failed to write: {}", e))?;
-        
-        println!("Created test library: {}", output_file);
-        Ok(())
-    }
-}
-
-/// Integration with existing emitter for RCL support
-pub trait RclEmitter {
-    fn emit_with_rcl(&mut self, program: &Program, rcl_libs: &[RclLibrary]) -> String;
-}
-
-impl RclEmitter for NasmEmitter {
-    fn emit_with_rcl(&mut self, program: &Program, rcl_libs: &[RclLibrary]) -> String {
-        let mut asm = self.compile_program(program);
-        
-        // Append RCL library assembly
-        for lib in rcl_libs {
-            asm.push_str(&format!("; RCL Library: {}\n", lib.metadata.name));
-            
-            for entry in &lib.entries {
-                match entry {
-                    RclEntry::Assembly(assembly) => {
-                        if assembly.target == self.target.format {
-                            asm.push_str(&format!("; Assembly from RCL: {}\n", assembly.label));
-                            asm.push_str(&assembly.code);
-                            asm.push_str("\n");
-                        }
-                    }
-                    RclEntry::Function(func) => {
-                        if let Some(func_asm) = &func.assembly {
-                            asm.push_str(&format!("; Function from RCL: {}\n", func.name));
-                            asm.push_str(func_asm);
-                            asm.push_str("\n");
-                        }
-                    }
-                    _ => {}
-                }
-            }
+        if !functions_found {
+            println!("No functions found in this library");
         }
         
-        asm
+        Ok(())
     }
-}
-
-/// Public API functions for RCL
-pub fn compile_with_rcl(source: &str, output_path: &str, target: Target) -> Result<(), String> {
-    let config = CompilerConfig {
-        target,
-        verbose: true,
-        keep_assembly: true,
-        optimize: true,
-    };
     
-    let mut compiler = RythonCompilerWithRcl::new(config);
-    compiler.enable_rcl();
-    compiler.compile_with_rcl(source, output_path)
-}
-
-pub fn create_rcl_library(source: &str, output_file: &str, target: &str) -> Result<(), String> {
-    let cli = RclCli::new(true);
-    cli.compile_to_rcl(source, output_file, target)
+    /// Create a test RCL library with real functions
+    pub fn create_test_library(&self, output_file: &str) -> Result<(), String> {
+        let library = create_test_library();
+        
+        let json = serde_json::to_string_pretty(&library)
+            .map_err(|e| format!("Failed to serialize: {}", e))?;
+        
+        std::fs::write(output_file, json)
+            .map_err(|e| format!("Failed to write: {}", e))?;
+        
+        println!("Created test library with real functions: {}", output_file);
+        Ok(())
+    }
 }

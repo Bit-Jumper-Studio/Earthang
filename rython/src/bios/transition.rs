@@ -1,6 +1,3 @@
-//! BIOS Transition Module - Bit Jumper System
-//! Handles mode transitions from 16-bit to 64-bit with optional feature enabling
-
 /// Compact 512-byte bootloader
 #[derive(Debug, Clone)]
 pub struct CompactBootloader {

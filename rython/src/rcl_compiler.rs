@@ -1,6 +1,3 @@
-// ==================== RYTHON COMPILED LIBRARY (RCL) SYSTEM ====================
-// Compiles Rython code to .rcl files (text-based compiled libraries)
-
 use std::collections::{HashMap, HashSet};
 use std::path::Path;
 use crate::parser::{Program, Statement, Expr};
@@ -561,19 +558,81 @@ impl RclCompiler {
         
         // Add basic math functions
         let math_program = crate::parser::parse_program(
-            "def add(a, b):\n\
-                 return a + b\n\
-             \n\
-             def subtract(a, b):\n\
-                 return a - b\n\
-             \n\
-             def multiply(a, b):\n\
-                 return a * b\n\
-             \n\
-             def divide(a, b):\n\
-                 return a / b\n\
-             \n\
-             var MATH_PI = 3.14159"
+            "def add(a, b): return a + b\n\
+             def subtract(a, b): return a - b\n\
+             def multiply(a, b): return a * b\n\
+             def divide(a, b): return a / b\n\
+             def abs(x): pass\n\
+             def pow(base, exp): pass\n\
+             def max(a, b): pass\n\
+             def min(a, b): pass\n\
+             def sum(arr): pass\n\
+             def round(x): pass\n\
+             def floor(x): pass\n\
+             def ceil(x): pass\n\
+             def sqrt(x): pass\n\
+             def sin(x): pass\n\
+             def cos(x): pass\n\
+             def tan(x): pass\n\
+             def log(x): pass\n\
+             def exp(x): pass\n\
+             def pi(): pass\n\
+             def e(): pass\n\
+             var PI = 3.141592653589793\n\
+             var E = 2.718281828459045\n\
+             def upper(s): pass\n\
+             def lower(s): pass\n\
+             def strip(s): pass\n\
+             def lstrip(s): pass\n\
+             def rstrip(s): pass\n\
+             def find(s, sub): pass\n\
+             def replace(s, old, new): pass\n\
+             def split(s, sep): pass\n\
+             def join(sep, arr): pass\n\
+             def startswith(s, sub): pass\n\
+             def endswith(s, sub): pass\n\
+             def isdigit(s): pass\n\
+             def isalpha(s): pass\n\
+             def format(s, *args): pass\n\
+             def input(prompt): pass\n\
+             def open(file, mode): pass\n\
+             def exit(code): pass\n\
+             var stdin = 0\n\
+             var stdout = 1\n\
+             var stderr = 2\n\
+             def print(*args): pass\n\
+             def type(obj): pass\n\
+             def len(obj): pass\n\
+             def range(start, stop, step): pass\n\
+             def bool(obj): pass\n\
+             def int(obj): pass\n\
+             def str(obj): pass\n\
+             def float(obj): pass\n\
+             var True = 1\n\
+             var False = 0\n\
+             var None = 0\n\
+             def array(typecode, initializer): pass\n\
+             def zeros(count): pass\n\
+             def ones(count): pass\n\
+             def append(arr, item): pass\n\
+             def extend(arr, other): pass\n\
+             def insert(arr, i, item): pass\n\
+             def remove(arr, item): pass\n\
+             def count(arr, item): pass\n\
+             def product(arr): pass\n\
+             def mean(arr): pass\n\
+             def sort(arr): pass\n\
+             def reverse(arr): pass\n\
+             def to_int(arr): pass\n\
+             def to_float(arr): pass\n\
+             var TYPECODE_I8 = 'b'\n\
+             var TYPECODE_U8 = 'B'\n\
+             var TYPECODE_I16 = 'h'\n\
+             var TYPECODE_U16 = 'H'\n\
+             var TYPECODE_I32 = 'i'\n\
+             var TYPECODE_U32 = 'I'\n\
+             var TYPECODE_F32 = 'f'\n\
+             var TYPECODE_F64 = 'd'"
         )?;
         
         compiler.compile_program(&math_program)?;

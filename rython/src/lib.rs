@@ -1,19 +1,14 @@
 pub mod parser;
-pub mod emitter;
 pub mod compiler;
-pub mod linker;
-pub mod utils;
-pub mod bios;
+pub mod backend;
 pub mod cli;
-pub mod backend; 
-pub mod rcl_compiler;      
-pub mod rcl_integration;   
+pub mod emitter;
+pub mod utils;
+pub mod linker;
+pub mod modules;  
+pub mod rcl_integration;
+pub mod rcl_compiler;  
 
-// Re-export commonly used items
-pub use compiler::*;
-pub use emitter::*;
-pub use parser::*;
-pub use cli::*;
-pub use backend::*; 
-pub use rcl_compiler::*;      
-pub use rcl_integration::*;
+pub use compiler::{RythonCompiler, CompilerConfig, Target as CompTarget};
+pub use backend::{Backend, BackendRegistry, Capability};
+pub use modules::ModuleRegistry;
