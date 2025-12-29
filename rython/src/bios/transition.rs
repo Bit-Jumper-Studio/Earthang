@@ -190,7 +190,7 @@ impl ModeTransitionEmitter {
         }
     }
     
-    /// Build bootloader with transitions
+    /// Build bootloader with transitions - FIXED VERSION
     pub fn create_bootloader(&mut self) -> Result<Vec<u8>, String> {
         let mut code = Vec::new();
         
@@ -211,28 +211,42 @@ impl ModeTransitionEmitter {
                         Feature::Graphics => code.extend_from_slice(&self.init_graphics()),
                     }
                 }
+                
+                // CRITICAL FIX: Add infinite loop BEFORE any data
+                code.extend_from_slice(&[
+                    0xFA,  // cli
+                    0xF4,  // hlt
+                    0xEB, 0xFD,  // jmp $
+                ]);
             }
             (Mode::Real16, Mode::Protected32) => {
                 code.extend_from_slice(&self.create_16bit_header());
                 code.extend_from_slice(&self.transition_to_32bit());
+                
+                // CRITICAL FIX: Add infinite loop BEFORE any data
+                code.extend_from_slice(&[
+                    0xFA,  // cli
+                    0xF4,  // hlt
+                    0xEB, 0xFD,  // jmp $
+                ]);
             }
             _ => {
                 return Err("Unsupported mode transition".to_string());
             }
         }
         
-        // Pad to 512 bytes if needed
-        if code.len() < 512 {
-            let padding = 512 - code.len();
-            for _ in 0..padding {
-                code.push(0x00);
-            }
-            // Set boot signature
-            if code.len() >= 512 {
-                code[510] = 0x55;
-                code[511] = 0xAA;
-            }
+        // Pad to 510 bytes
+        while code.len() < 510 {
+            code.push(0x00);
         }
+        
+        // Boot signature
+        code.push(0x55);
+        code.push(0xAA);
+        
+        // Add string data AFTER boot signature (at 0x7E00)
+        let string_data = b"Rython Bootloader\0";
+        code.extend_from_slice(string_data);
         
         Ok(code)
     }

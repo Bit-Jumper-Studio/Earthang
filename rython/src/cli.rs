@@ -61,7 +61,7 @@ impl Target {
     color = ColorChoice::Always,
     help_template = "\
 \x1b[1;36m{name}\x1b[0m \x1b[32m{version}\x1b[0m
-{author-with-newline}\x1b{1m{about}\x1b[0m
+{author-with-newline}\x1b[1m{about}\x1b[0m
 
 \x1b[1;33mUSAGE:\x1b[0m 
   {usage}
@@ -75,7 +75,7 @@ impl Target {
   \x1b[36mbios16\x1b[0m          16-bit Real Mode (Legacy, 512B limited)
   \x1b[36mbios32\x1b[0m          32-bit Protected Mode
   \x1b[36mbios64\x1b[0m          64-bit Long Mode (Default)
-  \x1b{36mbios64_sse\x1b[0m      64-bit + SSE Extensions
+  \x1b[36mbios64_sse\x1b[0m      64-bit + SSE Extensions
   \x1b[36mbios64_avx\x1b[0m      64-bit + AVX Support
   \x1b[36mbios64_avx512\x1b[0m   64-bit + AVX-512 Support
   \x1b[36mlinux64\x1b[0m         64-bit Linux ELF
@@ -139,6 +139,10 @@ enum Commands {
         /// Enable RCL mode
         #[arg(long, default_value_t = false)]
         rcl: bool,
+        
+        /// Override size limit warnings (not recommended)
+        #[arg(long)]
+        force: bool,
     },
 
     /// Generate standard bootloader boilerplate and mode-transition stubs
@@ -251,6 +255,10 @@ enum Commands {
         /// Use RCL libraries instead of inline compilation
         #[arg(long)]
         use_rcl: bool,
+        
+        /// Override size limit warnings
+        #[arg(long)]
+        force: bool,
     },
     
     /// Check syntax of a Rython file without compiling
@@ -263,6 +271,10 @@ enum Commands {
         /// Show detailed parse tree
         #[arg(short, long)]
         ast: bool,
+        
+        /// Estimate code size
+        #[arg(long)]
+        size: bool,
     },
 }
 
@@ -270,8 +282,8 @@ pub fn run() -> Result<(), String> {
     let cli = Cli::parse();
 
     match &cli.command {
-        Some(Commands::Compile { input, output, target, keep_asm, optimize, modules, rcl }) => {
-            handle_compile(input, output, target, *keep_asm, *optimize, modules, *rcl, &cli)
+        Some(Commands::Compile { input, output, target, keep_asm, optimize, modules, rcl, force }) => {
+            handle_compile(input, output, target, *keep_asm, *optimize, modules, *rcl, *force, &cli)
         }
         Some(Commands::Generate { r#type, output, size }) => {
             handle_generate(r#type, output, *size, &cli)
@@ -298,11 +310,11 @@ pub fn run() -> Result<(), String> {
         Some(Commands::GenerateModules { output, targets }) => {
             handle_generate_modules(output, targets, &cli)
         }
-        Some(Commands::CompileModules { input, output, target, use_rcl }) => {
-            handle_compile_modules(input, output, target, *use_rcl, &cli)
+        Some(Commands::CompileModules { input, output, target, use_rcl, force }) => {
+            handle_compile_modules(input, output, target, *use_rcl, *force, &cli)
         }
-        Some(Commands::Check { input, ast }) => {
-            handle_check(input, *ast, &cli)
+        Some(Commands::Check { input, ast, size }) => {
+            handle_check(input, *ast, *size, &cli)
         }
         None => {
             let mut cmd = Cli::command();
@@ -320,6 +332,7 @@ fn handle_compile(
     optimize: u8, 
     modules: &Option<String>,
     rcl: bool,
+    force: bool,
     cli: &Cli
 ) -> Result<(), String> {
     if !cli.quiet {
@@ -339,6 +352,18 @@ fn handle_compile(
         println!("{} {} ➜ {}", "Compiling".green().bold(), input.cyan(), output_name.cyan());
     }
     
+    // Read and analyze source for size estimation
+    let source = std::fs::read_to_string(input)
+        .map_err(|e| format!("IO Error: {}", e))?;
+    
+    // Estimate size and warn if large
+    let size_estimate = estimate_code_size(&source);
+    if size_estimate > 400 && !force {
+        println!("{} Warning: Code size is large (estimated {} bytes). Too many prints may cause crashes.", 
+            "⚠".yellow().bold(), size_estimate);
+        println!("  {} Use --force to override this warning", "Tip:".bright_black());
+    }
+    
     let nasm_executable = crate::utils::find_nasm();
     if cli.verbose > 0 {
         log_status("Debug", &format!("Using NASM at: {}", nasm_executable));
@@ -347,13 +372,9 @@ fn handle_compile(
             log_status("Debug", &format!("Modules: {}", modules_str));
         }
         log_status("Debug", &format!("RCL mode: {}", rcl));
+        log_status("Debug", &format!("Size estimate: {} bytes", size_estimate));
     }
 
-    // 1. Parsing
-    log_status("Parsing", input);
-    let source = std::fs::read_to_string(input)
-        .map_err(|e| format!("IO Error: {}", e))?;
-    
     // Parse modules from CLI
     let module_list = modules.as_ref()
         .map(|s| s.split(',').map(|m| m.trim().to_string()).collect::<Vec<_>>())
@@ -386,6 +407,9 @@ fn handle_compile(
                     if size_bytes == 512 {
                         println!("  {} Sector is valid bootloader size (512 bytes)", "★".yellow());
                     }
+                    if size_bytes > 400 {
+                        println!("  {} Large binary - ensure proper memory mapping", "⚠".yellow());
+                    }
                 }
                 return Ok(());
             }
@@ -414,7 +438,24 @@ fn handle_compile(
     Ok(())
 }
 
-fn handle_check(input: &str, show_ast: bool, cli: &Cli) -> Result<(), String> {
+fn estimate_code_size(source: &str) -> usize {
+    // Simple estimation: count string literals and print statements
+    let string_literals: Vec<_> = source
+        .split('"')
+        .enumerate()
+        .filter(|(i, _)| i % 2 == 1) // Odd indices are inside quotes
+        .map(|(_, s)| s.len())
+        .collect();
+    
+    let total_string_bytes: usize = string_literals.iter().sum();
+    let print_statements = source.matches("print").count();
+    let var_declarations = source.matches("var").count();
+    
+    // Base size + string overhead + print overhead + variable overhead
+    100 + (total_string_bytes * 2) + (print_statements * 15) + (var_declarations * 10)
+}
+
+fn handle_check(input: &str, show_ast: bool, show_size: bool, cli: &Cli) -> Result<(), String> {
     if !cli.quiet {
         println!("{}", "── Rython Syntax Check ──────────────────────────────────".bright_black());
     }
@@ -438,6 +479,14 @@ fn handle_check(input: &str, show_ast: bool, cli: &Cli) -> Result<(), String> {
             if !cli.quiet {
                 println!("\n{} Syntax check passed!", "✔".green().bold());
                 println!("  {} statements parsed", program.body.len());
+            }
+            
+            if show_size {
+                let size_estimate = estimate_code_size(&source);
+                println!("  Size estimate: {} bytes", size_estimate);
+                if size_estimate > 400 {
+                    println!("  {} Large code size - may cause boot sector overflow", "⚠".yellow());
+                }
             }
             
             if show_ast {
@@ -700,7 +749,7 @@ start:
     int 0x10
     
     ; Print message
-    mov si, msg_hello
+    mov si, 0x7E00  ; String data after boot sector
     call print_string
     
     ; Halt
@@ -718,10 +767,12 @@ print_string:
 .done:
     ret
 
-msg_hello db 'Rython BIOS 16-bit', 0
-
 times 510-($-$$) db 0
 dw 0xAA55
+
+; String data at 0x7E00
+times 512 db 0  ; Boot sector padding
+db 'Rython BIOS 16-bit', 0
 "#;
     
     fs::write(output_name, template)
@@ -838,7 +889,7 @@ long_mode:
     rep stosq
     
     ; Print message
-    mov rsi, msg_64
+    mov rsi, 0x7E00  ; String data after boot sector
     mov rdi, 0xB8000
     call print_string_64
     
@@ -850,12 +901,13 @@ long_mode:
 print_string_64:
     push rdi
 .loop:
-    lodsb
+    mov al, [rsi]
     test al, al
     jz .done
     stosb
     mov al, 0x0F
     stosb
+    inc rsi
     jmp .loop
 .done:
     pop rdi
@@ -881,10 +933,12 @@ gdt64_desc:
     dw gdt64_end - gdt64 - 1
     dq gdt64
 
-msg_64 db 'Rython 64-bit Long Mode', 0
-
 times 510-($-$$) db 0
 dw 0xAA55
+
+; String data at 0x7E00
+times 512 db 0  ; Boot sector padding
+db 'Rython 64-bit Long Mode', 0
 "#;
     
     fs::write(output_name, template)
@@ -1009,7 +1063,7 @@ long_mode:
     loop .clear_loop
     
     ; Print message
-    mov rsi, msg_sse
+    mov rsi, 0x7E00  ; String data after boot sector
     mov rdi, 0xB8000
     call print_string_64
     
@@ -1026,12 +1080,13 @@ long_mode:
 print_string_64:
     push rdi
 .loop:
-    lodsb
+    mov al, [rsi]
     test al, al
     jz .done
     stosb
     mov al, 0x0F
     stosb
+    inc rsi
     jmp .loop
 .done:
     pop rdi
@@ -1057,14 +1112,18 @@ gdt64_desc:
     dw gdt64_end - gdt64 - 1
     dq gdt64
 
-msg_sse db 'Rython 64-bit with SSE', 0
+times 510-($-$$) db 0
+dw 0xAA55
+
+; String data at 0x7E00
+times 512 db 0  ; Boot sector padding
+db 'Rython 64-bit with SSE', 0
+
+; SSE data
 rax_quad dq 0x0720072007200720
 test_vec1 db 1,2,3,4,5,6,7,8,9,10,11,12,13,14,15,16
 test_vec2 db 16,15,14,13,12,11,10,9,8,7,6,5,4,3,2,1
 result times 16 db 0
-
-times 510-($-$$) db 0
-dw 0xAA55
 "#;
     
     fs::write(output_name, template)
@@ -1101,7 +1160,7 @@ start:
     int 0x10
     
     ; Print message
-    mov si, msg
+    mov si, 0x7E00  ; String data after boot sector
     call print_string
     
     ; Halt
@@ -1119,11 +1178,13 @@ print_string:
 .done:
     ret
 
-msg db 'Rython {} Bootloader', 0
-
-times {} db 0
+times 510-($-$$) db 0
 dw 0xAA55
-"#, target, size, target, size - 2);
+
+; String data at 0x7E00
+times 512 db 0  ; Boot sector padding
+db 'Rython {} Bootloader', 0
+"#, target, size, target);
     
     fs::write(output_name, template)
         .map_err(|e| format!("Failed to write template: {}", e))?;
@@ -1184,7 +1245,7 @@ protected_mode:
     rep stosd
     
     ; Print message
-    mov esi, msg_32
+    mov esi, 0x7E00  ; String data after boot sector
     mov edi, 0xB8000
     call print_string_32
     
@@ -1195,12 +1256,13 @@ protected_mode:
 print_string_32:
     push edi
 .loop:
-    lodsb
+    mov al, [esi]
     test al, al
     jz .done
     stosb
     mov al, 0x0F
     stosb
+    inc esi
     jmp .loop
 .done:
     pop edi
@@ -1216,10 +1278,12 @@ gdt32_desc:
     dw gdt32_end - gdt32 - 1
     dd gdt32
 
-msg_32 db 'Rython 32-bit Protected Mode', 0
-
 times 510-($-$$) db 0
 dw 0xAA55
+
+; String data at 0x7E00
+times 512 db 0  ; Boot sector padding
+db 'Rython 32-bit Protected Mode', 0
 "#;
     
     fs::write(output_name, template)
@@ -1283,7 +1347,7 @@ fn handle_generate_modules(output: &str, targets: &[Target], cli: &Cli) -> Resul
     Ok(())
 }
 
-fn handle_compile_modules(input: &str, output: &Option<String>, target: &Target, use_rcl: bool, cli: &Cli) -> Result<(), String> {
+fn handle_compile_modules(input: &str, output: &Option<String>, target: &Target, use_rcl: bool, force: bool, cli: &Cli) -> Result<(), String> {
     if !cli.quiet {
         println!("{}", "── Rython Module Compilation ────────────────────────────".bright_black());
     }
@@ -1310,6 +1374,14 @@ fn handle_compile_modules(input: &str, output: &Option<String>, target: &Target,
     let source = fs::read_to_string(input)
         .map_err(|e| format!("IO Error: {}", e))?;
     
+    // Estimate size and warn if large
+    let size_estimate = estimate_code_size(&source);
+    if size_estimate > 400 && !force {
+        println!("{} Warning: Code size is large (estimated {} bytes). Too many prints may cause crashes.", 
+            "⚠".yellow().bold(), size_estimate);
+        println!("  {} Use --force to override this warning", "Tip:".bright_black());
+    }
+    
     // Create config with modules
     let config = CompilerConfig {
         target: target.to_compiler_target(),
@@ -1334,6 +1406,9 @@ fn handle_compile_modules(input: &str, output: &Option<String>, target: &Target,
         let metadata = std::fs::metadata(&output_name).map_err(|e| e.to_string())?;
         let size_bytes = metadata.len();
         println!("\n{} Created {} ({} bytes)", "✔".green().bold(), output_name.bright_white().bold(), size_bytes);
+        if size_bytes > 400 {
+            println!("  {} Large binary - ensure proper memory mapping", "⚠".yellow());
+        }
     }
     
     Ok(())

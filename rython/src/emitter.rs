@@ -48,6 +48,7 @@ pub struct NasmEmitter {
     pub target: TargetConfig,
     label_counter: u32,
     variable_offsets: HashMap<String, i32>,
+    byte_counter: ByteCounter,
 }
 
 impl NasmEmitter {
@@ -56,6 +57,7 @@ impl NasmEmitter {
             target: TargetConfig::linux64(),
             label_counter: 0,
             variable_offsets: HashMap::new(),
+            byte_counter: ByteCounter::new(),
         }
     }
     
@@ -105,9 +107,10 @@ impl NasmEmitter {
     }
     
     // Main compilation
-    pub fn compile_program(&mut self, program: &Program) -> String {
+    pub fn compile_program(&mut self, program: &Program) -> Result<String, String> {
         self.label_counter = 0;
         self.variable_offsets.clear();
+        self.byte_counter.reset();
         
         // Check for imports first
         if self.has_imports(program) {
@@ -122,52 +125,60 @@ impl NasmEmitter {
     }
     
     // Compile with automatic import handling
-    fn compile_with_imports(&mut self, program: &Program) -> String {
+    fn compile_with_imports(&mut self, program: &Program) -> Result<String, String> {
         match self.process_imports(program) {
             Ok((filtered_program, library_asm)) => {
                 // Compile main program
                 let main_asm = if self.target.is_bios() {
-                    self.compile_bios(&filtered_program)
+                    self.compile_bios(&filtered_program)?
                 } else {
-                    self.compile_standard(&filtered_program)
+                    self.compile_standard(&filtered_program)?
                 };
                 
                 // Combine with library assembly
                 if !library_asm.is_empty() {
-                    format!("{}\n\n; ========== IMPORTED LIBRARIES ==========\n\n{}", main_asm, library_asm)
+                    Ok(format!("{}\n\n; ========== IMPORTED LIBRARIES ==========\n\n{}", main_asm, library_asm))
                 } else {
-                    main_asm
+                    Ok(main_asm)
                 }
             }
             Err(e) => {
                 // Fall back to compilation without imports
-                format!("; Warning: Failed to process imports: {}\n\n{}", e, 
+                Ok(format!("; Warning: Failed to process imports: {}\n\n{}", e, 
                     if self.target.is_bios() {
-                        self.compile_bios(program)
+                        self.compile_bios(program)?
                     } else {
-                        self.compile_standard(program)
-                    })
+                        self.compile_standard(program)?
+                    }))
             }
         }
     }
     
-    fn compile_bios(&mut self, program: &Program) -> String {
+    fn compile_bios(&mut self, program: &Program) -> Result<String, String> {
         let mut code = String::new();
         
         match self.target.platform {
-            TargetPlatform::Bios16 => self.compile_bios16(&mut code, program),
-            TargetPlatform::Bios32 => self.compile_bios32(&mut code, program),
-            TargetPlatform::Bios64 => self.compile_bios64_fixed(&mut code, program),
-            TargetPlatform::Bios64SSE => self.compile_bios64_sse(&mut code, program),
-            TargetPlatform::Bios64AVX => self.compile_bios64_avx(&mut code, program),
-            TargetPlatform::Bios64AVX512 => self.compile_bios64_avx512(&mut code, program),
+            TargetPlatform::Bios16 => self.compile_bios16(&mut code, program)?,
+            TargetPlatform::Bios32 => self.compile_bios32(&mut code, program)?,
+            TargetPlatform::Bios64 => self.compile_bios64_fixed(&mut code, program)?,
+            TargetPlatform::Bios64SSE => self.compile_bios64_sse(&mut code, program)?,
+            TargetPlatform::Bios64AVX => self.compile_bios64_avx(&mut code, program)?,
+            TargetPlatform::Bios64AVX512 => self.compile_bios64_avx512(&mut code, program)?,
             _ => { code.push_str("; Unsupported BIOS target\n"); }
         }
         
-        code
+        // Check size limits
+        if self.byte_counter.exceeds_limit(80) {
+            return Err(format!(
+                "Code size limit exceeded: estimated {} bytes (80% of 512 byte limit). Reduce print statements or string literals.",
+                self.byte_counter.total()
+            ));
+        }
+        
+        Ok(code)
     }
     
-    fn compile_bios16(&mut self, code: &mut String, program: &Program) {
+    fn compile_bios16(&mut self, code: &mut String, program: &Program) -> Result<(), String> {
         code.push_str("; Rython 16-bit Bootloader\n\n");
         code.push_str("    org 0x7C00\n");
         code.push_str("    bits 16\n\n");
@@ -184,11 +195,12 @@ impl NasmEmitter {
         code.push_str("    mov ax, 0x0003\n");
         code.push_str("    int 0x10\n\n");
         
-        code.push_str("    mov si, msg\n");
+        code.push_str("    mov si, 0x7E00  ; String data starts after 512 bytes\n");
         code.push_str("    call print_string\n\n");
         
         self.compile_bios16_statements(code, &program.body);
         
+        // CRITICAL: Add infinite loop BEFORE any data
         code.push_str("\n    cli\n");
         code.push_str("    hlt\n");
         code.push_str("    jmp $\n\n");
@@ -228,14 +240,19 @@ impl NasmEmitter {
         code.push_str("    popa\n");
         code.push_str("    ret\n\n");
         
-        code.push_str("msg:\n");
-        code.push_str("    db 'Rython 16-bit', 0\n\n");
-        
+        // Boot sector padding and signature
         code.push_str("    times 510-($-$$) db 0\n");
-        code.push_str("    dw 0xAA55\n");
+        code.push_str("    dw 0xAA55\n\n");
+        
+        // String data AFTER boot sector
+        code.push_str("    ; String data at 0x7E00\n");
+        code.push_str("    times 512 db 0  ; Boot sector padding\n");
+        code.push_str("    db 'Rython 16-bit', 0\n");
+        
+        Ok(())
     }
     
-    fn compile_bios32(&mut self, code: &mut String, program: &Program) {
+    fn compile_bios32(&mut self, code: &mut String, program: &Program) -> Result<(), String> {
         code.push_str("; Rython 32-bit Bootloader\n\n");
         code.push_str("    org 0x7C00\n");
         code.push_str("    bits 16\n\n");
@@ -274,12 +291,13 @@ impl NasmEmitter {
         code.push_str("    mov ss, ax\n");
         code.push_str("    mov esp, 0x7C00\n\n");
         
-        code.push_str("    mov esi, msg\n");
+        code.push_str("    mov esi, 0x7E00  ; String data starts after 512 bytes\n");
         code.push_str("    mov edi, 0xB8000\n");
         code.push_str("    call print_string_32\n\n");
         
         self.compile_bios32_statements(code, &program.body);
         
+        // CRITICAL: Add infinite loop BEFORE any data
         code.push_str("\n    cli\n");
         code.push_str("    hlt\n");
         code.push_str("    jmp $\n\n");
@@ -288,10 +306,11 @@ impl NasmEmitter {
         code.push_str("print_string_32:\n");
         code.push_str("    pusha\n");
         code.push_str(".loop:\n");
-        code.push_str("    lodsb\n");
+        code.push_str("    mov al, [esi]\n");
         code.push_str("    test al, al\n");
         code.push_str("    jz .done\n");
         code.push_str("    mov [edi], al\n");
+        code.push_str("    inc esi\n");
         code.push_str("    inc edi\n");
         code.push_str("    mov byte [edi], 0x0F\n");
         code.push_str("    inc edi\n");
@@ -334,18 +353,24 @@ impl NasmEmitter {
         code.push_str("    dw gdt32_end - gdt32 - 1\n");
         code.push_str("    dd gdt32\n\n");
         
-        code.push_str("msg:\n");
-        code.push_str("    db 'Rython 32-bit', 0\n\n");
-        
+        // Boot sector padding and signature
         code.push_str("    times 510-($-$$) db 0\n");
-        code.push_str("    dw 0xAA55\n");
+        code.push_str("    dw 0xAA55\n\n");
+        
+        // String data AFTER boot sector
+        code.push_str("    ; String data at 0x7E00\n");
+        code.push_str("    times 512 db 0  ; Boot sector padding\n");
+        code.push_str("    db 'Rython 32-bit', 0\n");
+        
+        Ok(())
     }
     
-    // FIXED 64-bit bootloader - with corrected instructions
-    fn compile_bios64_fixed(&mut self, code: &mut String, program: &Program) {
+    // FIXED 64-bit bootloader - with corrected instructions and proper code/data separation
+    fn compile_bios64_fixed(&mut self, code: &mut String, program: &Program) -> Result<(), String> {
         code.push_str("; Rython 64-bit Bootloader - Fixed Version\n\n");
         code.push_str("    org 0x7C00\n");
         code.push_str("    bits 16\n\n");
+        
         code.push_str("start:\n");
         code.push_str("    cli\n");
         code.push_str("    xor ax, ax\n");
@@ -450,14 +475,15 @@ impl NasmEmitter {
         code.push_str("    mov rcx, 1000\n");
         code.push_str("    rep stosq\n\n");
         
-        // Print message (64-bit)
-        code.push_str("    mov rsi, msg_64\n");
+        // Print message (64-bit) - FIXED: Load from fixed data segment
+        code.push_str("    mov rsi, 0x7E00  ; String data starts after 512 bytes\n");
         code.push_str("    mov rdi, 0xB8000\n");
         code.push_str("    call print_string_64\n\n");
         
         // Compile program
-        self.compile_bios64_statements(code, &program.body);
+        self.compile_bios64_statements(code, &program.body)?;
         
+        // CRITICAL: End code with infinite loop BEFORE any data
         code.push_str("\n    cli\n");
         code.push_str("    hlt\n");
         code.push_str("    jmp $\n\n");
@@ -466,12 +492,13 @@ impl NasmEmitter {
         code.push_str("print_string_64:\n");
         code.push_str("    push rdi\n");
         code.push_str(".loop:\n");
-        code.push_str("    lodsb\n");
+        code.push_str("    mov al, [rsi]\n");
         code.push_str("    test al, al\n");
         code.push_str("    jz .done\n");
         code.push_str("    stosb\n");
         code.push_str("    mov al, 0x0F\n");
         code.push_str("    stosb\n");
+        code.push_str("    inc rsi\n");
         code.push_str("    jmp .loop\n");
         code.push_str(".done:\n");
         code.push_str("    pop rdi\n");
@@ -530,31 +557,38 @@ impl NasmEmitter {
         code.push_str("    dw gdt64_end - gdt64 - 1\n");
         code.push_str("    dq gdt64\n\n");
         
-        // ========== Data ==========
-        code.push_str("msg_64:\n");
-        code.push_str("    db 'Rython 64-bit', 0\n\n");
-        
+        // Boot signature
         code.push_str("    times 510-($-$$) db 0\n");
-        code.push_str("    dw 0xAA55\n");
+        code.push_str("    dw 0xAA55\n\n");
+        
+        // ========== DATA SECTION (starts at 0x7E00) ==========
+        code.push_str("    ; String data at 0x7E00 (after boot sector)\n");
+        code.push_str("    times 512 db 0  ; Boot sector padding\n");
+        code.push_str("    db 'Rython 64-bit', 0\n");
+        
+        Ok(())
     }
     
     // Other BIOS variants
-    fn compile_bios64_sse(&mut self, code: &mut String, program: &Program) {
-        self.compile_bios64_fixed(code, program);
+    fn compile_bios64_sse(&mut self, code: &mut String, program: &Program) -> Result<(), String> {
+        self.compile_bios64_fixed(code, program)?;
         code.push_str("\n    ; SSE enabled\n");
+        Ok(())
     }
     
-    fn compile_bios64_avx(&mut self, code: &mut String, program: &Program) {
-        self.compile_bios64_fixed(code, program);
+    fn compile_bios64_avx(&mut self, code: &mut String, program: &Program) -> Result<(), String> {
+        self.compile_bios64_fixed(code, program)?;
         code.push_str("\n    ; AVX enabled\n");
+        Ok(())
     }
     
-    fn compile_bios64_avx512(&mut self, code: &mut String, program: &Program) {
-        self.compile_bios64_fixed(code, program);
+    fn compile_bios64_avx512(&mut self, code: &mut String, program: &Program) -> Result<(), String> {
+        self.compile_bios64_fixed(code, program)?;
         code.push_str("\n    ; AVX-512 enabled\n");
+        Ok(())
     }
     
-    // Compilation helpers - KEEP THESE THE SAME
+    // Compilation helpers
     fn compile_bios16_statements(&mut self, code: &mut String, statements: &[Statement]) {
         for stmt in statements {
             match stmt {
@@ -587,62 +621,132 @@ impl NasmEmitter {
         }
     }
     
-    fn compile_bios64_statements(&mut self, code: &mut String, statements: &[Statement]) {
+    fn compile_bios64_statements(&mut self, code: &mut String, statements: &[Statement]) -> Result<(), String> {
         for stmt in statements {
             match stmt {
                 Statement::Expr(expr) => {
                     code.push_str("    ; Expression\n");
-                    self.compile_bios64_expression(code, expr);
+                    self.compile_bios64_expression(code, expr)?;
                 }
                 Statement::VarDecl { name, value, .. } => {
                     code.push_str(&format!("    ; var {} = ", name));
-                    self.compile_bios64_expression(code, value);
+                    self.compile_bios64_expression(code, value)?;
                 }
                 _ => code.push_str("    ; [Statement]\n"),
             }
         }
+        Ok(())
     }
     
     fn compile_bios16_expression(&mut self, code: &mut String, expr: &Expr) {
         match expr {
             Expr::Number(n, _) => {
+                self.byte_counter.add(10); // mov ax + call overhead
                 code.push_str(&format!("    ; Number: {}\n", n));
                 code.push_str(&format!("    mov ax, {}\n", n));
                 code.push_str("    call print_decimal\n");
             }
-            _ => code.push_str("    ; [Expression]\n"),
+            Expr::String(s, _) => {
+                self.byte_counter.add(s.len() + 20); // String overhead
+                code.push_str(&format!("    ; String: '{}'\n", s));
+                code.push_str("    ; Strings must be in data section\n");
+            }
+            _ => {
+                self.byte_counter.add(5);
+                code.push_str("    ; [Expression]\n");
+            }
         }
     }
     
     fn compile_bios32_expression(&mut self, code: &mut String, expr: &Expr) {
         match expr {
             Expr::Number(n, _) => {
+                self.byte_counter.add(10);
                 code.push_str(&format!("    ; Number: {}\n", n));
                 code.push_str(&format!("    mov eax, {}\n", n));
                 code.push_str("    call print_decimal_32\n");
             }
-            _ => code.push_str("    ; [Expression]\n"),
+            Expr::String(s, _) => {
+                self.byte_counter.add(s.len() + 20);
+                code.push_str(&format!("    ; String: '{}'\n", s));
+                code.push_str("    ; Strings must be in data section\n");
+            }
+            _ => {
+                self.byte_counter.add(5);
+                code.push_str("    ; [Expression]\n");
+            }
         }
     }
     
-    fn compile_bios64_expression(&mut self, code: &mut String, expr: &Expr) {
+    fn compile_bios64_expression(&mut self, code: &mut String, expr: &Expr) -> Result<(), String> {
         match expr {
             Expr::Number(n, _) => {
+                self.byte_counter.add(15);
                 code.push_str(&format!("    ; Number: {}\n", n));
                 code.push_str(&format!("    mov rax, {}\n", n));
                 code.push_str("    call print_decimal_64\n");
             }
-            _ => code.push_str("    ; [Expression]\n"),
+            Expr::String(s, _) => {
+                self.byte_counter.add(s.len() + 25);
+                if self.byte_counter.exceeds_limit(80) {
+                    return Err(format!(
+                        "String '{}' would exceed boot sector limit. Reduce string literals.",
+                        if s.len() > 20 { format!("{}...", &s[..20]) } else { s.clone() }
+                    ));
+                }
+                code.push_str(&format!("    ; String: '{}'\n", s));
+                code.push_str("    ; Strings must be in data section at 0x7E00\n");
+            }
+            Expr::Call { func, args, kwargs: _, span: _ } if func == "print" => {
+                self.byte_counter.add(20); // Print overhead
+                for arg in args {
+                    self.compile_bios64_expression(code, arg)?;
+                }
+            }
+            _ => {
+                self.byte_counter.add(5);
+                code.push_str("    ; [Expression]\n");
+            }
         }
+        Ok(())
     }
     
-    fn compile_standard(&mut self, _program: &Program) -> String {
-        String::from("; Standard compilation not implemented\n")
+    fn compile_standard(&self, _program: &Program) -> Result<String, String> {
+        Ok(String::from("; Standard compilation not implemented\n"))
+    }
+}
+
+// Byte counter for size limiting
+struct ByteCounter {
+    total: usize,
+    limit: usize,
+}
+
+impl ByteCounter {
+    fn new() -> Self {
+        Self { total: 0, limit: 512 }
+    }
+    
+    fn reset(&mut self) {
+        self.total = 0;
+    }
+    
+    fn add(&mut self, bytes: usize) {
+        self.total += bytes;
+    }
+    
+    fn exceeds_limit(&self, threshold_percent: u8) -> bool {
+        let threshold = (self.limit * threshold_percent as usize) / 100;
+        self.total > threshold
+    }
+    
+    fn total(&self) -> usize {
+        self.total
     }
 }
 
 // Public interface
-pub fn compile_to_nasm(program: &Program) -> String {
+pub fn compile_to_nasm(program: &Program) -> Result<String, String> {
     let mut emitter = NasmEmitter::new();
     emitter.compile_program(program)
 }

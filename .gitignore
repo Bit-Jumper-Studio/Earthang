@@ -15,3 +15,5 @@ build_py
 __pycache__
 
 tests
+
+rython/test/rython

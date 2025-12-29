@@ -1,0 +1,14 @@
+# Simple test with visible output
+# We'll use line numbers to see what executes
+
+print("Line 1: Starting test")
+print("Line 2: In BIOS64 mode")
+print("Line 3: Calling hello function")
+
+def hello():
+    print("Line 4: Inside hello()")
+
+hello()
+
+print("Line 5: Back from hello()")
+print("Line 6: Test complete")

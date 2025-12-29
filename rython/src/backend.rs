@@ -1,4 +1,8 @@
 use crate::parser::{Program, Statement, Expr, Position, Span};
+use std::collections::HashMap;
+use std::cell::RefCell;
+
+// ========== CORE TYPE DEFINITIONS ==========
 
 // Capabilities for backend selection
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
@@ -96,13 +100,73 @@ pub trait Backend {
     fn compile_expression(&self, expr: &Expr) -> Result<String, String>;
 }
 
+// ========== BACKEND REGISTRY ==========
+
+pub struct BackendRegistry {
+    pub backends: Vec<Box<dyn Backend>>,
+}
+
+impl BackendRegistry {
+    pub fn new() -> Self {
+        Self {
+            backends: Vec::new(),
+        }
+    }
+    
+    pub fn register(&mut self, backend: Box<dyn Backend>) {
+        self.backends.push(backend);
+    }
+    
+    pub fn find_backend(&self, module: &BackendModule) -> Option<&dyn Backend> {
+        self.backends.iter()
+            .find(|b| {
+                b.can_compile(module) && self.capabilities_match(b.as_ref(), &module.required_capabilities)
+            })
+            .map(|b| b.as_ref())
+    }
+
+    fn capabilities_match(&self, backend: &dyn Backend, module_caps: &[Capability]) -> bool {
+        let backend_caps = backend.supported_capabilities();
+        module_caps.iter().all(|cap| backend_caps.contains(cap))
+    }
+    
+    pub fn default_registry() -> Self {
+        let mut registry = Self::new();
+        
+        // Register all available backends
+        registry.register(Box::new(Bios16Backend::new()));
+        registry.register(Box::new(Bios32Backend::new()));
+        registry.register(Box::new(Bios64Backend::new()));
+        registry.register(Box::new(Bios64Backend::new().with_sse()));
+        registry.register(Box::new(Bios64Backend::new().with_avx()));
+        registry.register(Box::new(Bios64Backend::new().with_avx512()));
+        registry.register(Box::new(Linux64Backend::new()));
+        registry.register(Box::new(Windows64Backend::new()));
+        
+        registry
+    }
+}
+
 // ========== BIOS 16-BIT BACKEND ==========
 
-pub struct Bios16Backend;
+pub struct Bios16Backend {
+    string_literals: HashMap<String, String>,
+}
 
 impl Bios16Backend {
     pub fn new() -> Self {
-        Self
+        Self {
+            string_literals: HashMap::new(),
+        }
+    }
+    
+    fn generate_string_data(&self) -> String {
+        let mut data = String::new();
+        for (content, label) in &self.string_literals {
+            data.push_str(&format!("{}:\n", label));
+            data.push_str(&format!("    db '{}', 0\n", content.replace("'", "''")));
+        }
+        data
     }
 }
 
@@ -172,7 +236,45 @@ impl Backend for Bios16Backend {
         asm.push_str("    hlt\n");
         asm.push_str("    jmp $\n\n");
         
-        asm.push_str("    times 510-($-$$) db 0\n");
+        // 16-bit subroutines
+        asm.push_str("print_string:\n");
+        asm.push_str("    pusha\n");
+        asm.push_str(".loop:\n");
+        asm.push_str("    lodsb\n");
+        asm.push_str("    test al, al\n");
+        asm.push_str("    jz .done\n");
+        asm.push_str("    int 0x10\n");
+        asm.push_str("    jmp .loop\n");
+        asm.push_str(".done:\n");
+        asm.push_str("    popa\n");
+        asm.push_str("    ret\n\n");
+        
+        asm.push_str("print_decimal:\n");
+        asm.push_str("    ; Print decimal number in AX\n");
+        asm.push_str("    pusha\n");
+        asm.push_str("    mov cx, 0\n");
+        asm.push_str("    mov bx, 10\n");
+        asm.push_str(".div_loop:\n");
+        asm.push_str("    xor dx, dx\n");
+        asm.push_str("    div bx\n");
+        asm.push_str("    push dx\n");
+        asm.push_str("    inc cx\n");
+        asm.push_str("    test ax, ax\n");
+        asm.push_str("    jnz .div_loop\n");
+        asm.push_str(".print_loop:\n");
+        asm.push_str("    pop ax\n");
+        asm.push_str("    add al, '0'\n");
+        asm.push_str("    mov ah, 0x0E\n");
+        asm.push_str("    int 0x10\n");
+        asm.push_str("    loop .print_loop\n");
+        asm.push_str("    popa\n");
+        asm.push_str("    ret\n\n");
+        
+        // String data
+        asm.push_str("; String literals\n");
+        asm.push_str(&self.generate_string_data());
+        
+        asm.push_str("\n    times 510-($-$$) db 0\n");
         asm.push_str("    dw 0xAA55\n");
         
         Ok(asm)
@@ -189,11 +291,13 @@ impl Backend for Bios16Backend {
     fn compile_expression(&self, expr: &Expr) -> Result<String, String> {
         match expr {
             Expr::Number(n, _) => Ok(format!("    ; Number: {}\n    mov ax, {}\n    call print_decimal\n", n, n)),
+            Expr::String(s, _) => Ok(format!("    ; String: '{}'\n    mov si, str_const\n    call print_string\n", s)),
             Expr::Call { func, args, kwargs: _, span: _ } => {
                 if func == "print" {
                     let mut code = String::new();
                     for arg in args {
-                        code.push_str(&self.compile_expression(arg)?);
+                        let arg_code = self.compile_expression(arg)?;
+                        code.push_str(&arg_code);
                     }
                     Ok(code)
                 } else {
@@ -207,11 +311,24 @@ impl Backend for Bios16Backend {
 
 // ========== BIOS 32-BIT BACKEND ==========
 
-pub struct Bios32Backend;
+pub struct Bios32Backend {
+    string_literals: HashMap<String, String>,
+}
 
 impl Bios32Backend {
     pub fn new() -> Self {
-        Self
+        Self {
+            string_literals: HashMap::new(),
+        }
+    }
+    
+    fn generate_string_data(&self) -> String {
+        let mut data = String::new();
+        for (content, label) in &self.string_literals {
+            data.push_str(&format!("{}:\n", label));
+            data.push_str(&format!("    db '{}', 0\n", content.replace("'", "''")));
+        }
+        data
     }
 }
 
@@ -302,6 +419,50 @@ impl Backend for Bios32Backend {
         asm.push_str("    hlt\n");
         asm.push_str("    jmp $\n\n");
         
+        // 32-bit subroutines
+        asm.push_str("print_string_32:\n");
+        asm.push_str("    pusha\n");
+        asm.push_str(".loop:\n");
+        asm.push_str("    lodsb\n");
+        asm.push_str("    test al, al\n");
+        asm.push_str("    jz .done\n");
+        asm.push_str("    mov [edi], al\n");
+        asm.push_str("    inc edi\n");
+        asm.push_str("    mov byte [edi], 0x0F\n");
+        asm.push_str("    inc edi\n");
+        asm.push_str("    jmp .loop\n");
+        asm.push_str(".done:\n");
+        asm.push_str("    popa\n");
+        asm.push_str("    ret\n\n");
+        
+        asm.push_str("print_decimal_32:\n");
+        asm.push_str("    ; Print decimal number in EAX\n");
+        asm.push_str("    pusha\n");
+        asm.push_str("    mov ecx, 0\n");
+        asm.push_str("    mov ebx, 10\n");
+        asm.push_str("    mov edi, 0xB8000 + 160  ; Second line\n");
+        asm.push_str(".div_loop:\n");
+        asm.push_str("    xor edx, edx\n");
+        asm.push_str("    div ebx\n");
+        asm.push_str("    push dx\n");
+        asm.push_str("    inc ecx\n");
+        asm.push_str("    test eax, eax\n");
+        asm.push_str("    jnz .div_loop\n");
+        asm.push_str(".print_loop:\n");
+        asm.push_str("    pop ax\n");
+        asm.push_str("    add al, '0'\n");
+        asm.push_str("    mov [edi], al\n");
+        asm.push_str("    inc edi\n");
+        asm.push_str("    mov byte [edi], 0x0F\n");
+        asm.push_str("    inc edi\n");
+        asm.push_str("    loop .print_loop\n");
+        asm.push_str("    popa\n");
+        asm.push_str("    ret\n\n");
+        
+        // String data
+        asm.push_str("; String literals\n");
+        asm.push_str(&self.generate_string_data());
+        
         // GDT
         asm.push_str("gdt32:\n");
         asm.push_str("    dq 0x0000000000000000\n");
@@ -330,6 +491,10 @@ impl Backend for Bios32Backend {
     fn compile_expression(&self, expr: &Expr) -> Result<String, String> {
         match expr {
             Expr::Number(n, _) => Ok(format!("    mov eax, {}\n    call print_decimal_32\n", n)),
+            Expr::String(s, _) => {
+                let label = format!("str_{}", s.hash_code());
+                Ok(format!("    ; String: '{}'\n    mov esi, {}\n    mov edi, 0xB8000\n    call print_string_32\n", s, label))
+            }
             Expr::Call { func, args, kwargs: _, span: _ } => {
                 if func == "print" {
                     let mut code = String::new();
@@ -352,6 +517,10 @@ pub struct Bios64Backend {
     use_sse: bool,
     use_avx: bool,
     use_avx512: bool,
+    string_counter: RefCell<u32>,
+    string_literals: RefCell<HashMap<String, String>>,
+    #[allow(dead_code)]
+    code_size_limit: usize,
 }
 
 impl Bios64Backend {
@@ -360,8 +529,31 @@ impl Bios64Backend {
             use_sse: false,
             use_avx: false,
             use_avx512: false,
+            string_counter: RefCell::new(0),
+            string_literals: RefCell::new(HashMap::new()),
+            code_size_limit: 4096,  // 4KB max for kernel
         }
     }
+    
+    // Add this method to check size
+    #[allow(dead_code)]
+    fn check_code_size(&self, code: &str, strings: &HashMap<String, String>) -> Result<(), String> {
+        let code_bytes = code.len();
+        let string_bytes: usize = strings.values()
+            .map(|s| s.len() + 1)  // +1 for null terminator
+            .sum();
+        let total = code_bytes + string_bytes;
+        
+        if total > self.code_size_limit {
+            Err(format!(
+                "Code size limit exceeded: {} bytes (limit: {}). Too many print statements or string data.",
+                total, self.code_size_limit
+            ))
+        } else {
+            Ok(())
+        }
+    }
+    
     
     pub fn with_sse(mut self) -> Self {
         self.use_sse = true;
@@ -376,6 +568,29 @@ impl Bios64Backend {
     pub fn with_avx512(mut self) -> Self {
         self.use_avx512 = true;
         self
+    }
+    
+    fn get_string_label(&self, content: &str) -> String {
+        let mut literals = self.string_literals.borrow_mut();
+        if let Some(label) = literals.get(content) {
+            return label.clone();
+        }
+        
+        let mut counter = self.string_counter.borrow_mut();
+        let label = format!("str_{}", *counter);
+        *counter += 1;
+        literals.insert(content.to_string(), label.clone());
+        label
+    }
+    
+    fn generate_string_data(&self) -> String {
+        let literals = self.string_literals.borrow();
+        let mut data = String::new();
+        for (content, label) in &*literals {
+            data.push_str(&format!("{}:\n", label));
+            data.push_str(&format!("    db '{}', 0\n", content.replace("'", "''")));
+        }
+        data
     }
 }
 
@@ -678,6 +893,10 @@ impl Backend for Bios64Backend {
         asm.push_str("msg_64:\n");
         asm.push_str("    db 'Rython 64-bit', 0\n\n");
         
+        // String literals
+        asm.push_str("; String literals\n");
+        asm.push_str(&self.generate_string_data());
+        
         asm.push_str("    times 510-($-$$) db 0\n");
         asm.push_str("    dw 0xAA55\n");
         
@@ -716,15 +935,19 @@ impl Backend for Bios64Backend {
                 code.push_str(&format!("    mov rax, {}\n", n));
                 code.push_str("    call print_decimal_64\n");
             }
+            Expr::String(s, _) => {
+                let label = self.get_string_label(s);
+                code.push_str(&format!("    ; String: '{}'\n", s));
+                code.push_str(&format!("    mov rsi, {}\n", label));
+                code.push_str("    mov rdi, 0xB8000 + 320  ; Third line\n");
+                code.push_str("    call print_string_64\n");
+            }
             Expr::Call { func, args, kwargs: _, span: _ } => {
                 if func == "print" {
                     for arg in args {
                         let arg_code = self.compile_expression(arg)?;
                         code.push_str(&arg_code);
                     }
-                    code.push_str("    ; print intrinsic\n");
-                    code.push_str("    mov rsi, msg_print\n");
-                    code.push_str("    call print_string_64\n");
                 } else {
                     code.push_str(&format!("    call {}\n", func));
                 }
@@ -771,11 +994,40 @@ impl Backend for Bios64Backend {
 
 // ========== LINUX 64-BIT BACKEND ==========
 
-pub struct Linux64Backend;
+pub struct Linux64Backend {
+    string_counter: RefCell<u32>,
+    string_literals: RefCell<HashMap<String, String>>,
+}
 
 impl Linux64Backend {
     pub fn new() -> Self {
-        Self
+        Self {
+            string_counter: RefCell::new(0),
+            string_literals: RefCell::new(HashMap::new()),
+        }
+    }
+    
+    fn get_string_label(&self, content: &str) -> String {
+        let mut literals = self.string_literals.borrow_mut();
+        if let Some(label) = literals.get(content) {
+            return label.clone();
+        }
+        
+        let mut counter = self.string_counter.borrow_mut();
+        let label = format!("str_{}", *counter);
+        *counter += 1;
+        literals.insert(content.to_string(), label.clone());
+        label
+    }
+    
+    fn generate_string_data(&self) -> String {
+        let literals = self.string_literals.borrow();
+        let mut data = String::new();
+        for (content, label) in &*literals {
+            data.push_str(&format!("{}:\n", label));
+            data.push_str(&format!("    db '{}', 0\n", content.replace("'", "''")));
+        }
+        data
     }
 }
 
@@ -826,6 +1078,40 @@ impl Backend for Linux64Backend {
         asm.push_str("    xor rdi, rdi   ; exit code 0\n");
         asm.push_str("    syscall\n");
         
+        // String print function
+        asm.push_str("\n; Print string function\n");
+        asm.push_str("print_string:\n");
+        asm.push_str("    ; rsi = string address\n");
+        asm.push_str("    push rcx\n");
+        asm.push_str("    push rdx\n");
+        asm.push_str("    push rdi\n");
+        asm.push_str("    push rsi\n");
+        asm.push_str("    \n");
+        asm.push_str("    ; Calculate string length\n");
+        asm.push_str("    mov rdi, rsi\n");
+        asm.push_str("    xor rcx, rcx\n");
+        asm.push_str("    dec rcx\n");
+        asm.push_str(".count_loop:\n");
+        asm.push_str("    inc rcx\n");
+        asm.push_str("    cmp byte [rdi + rcx], 0\n");
+        asm.push_str("    jne .count_loop\n");
+        asm.push_str("    \n");
+        asm.push_str("    ; Write to stdout\n");
+        asm.push_str("    mov rax, 1        ; sys_write\n");
+        asm.push_str("    mov rdi, 1        ; stdout\n");
+        asm.push_str("    mov rdx, rcx      ; length\n");
+        asm.push_str("    syscall\n");
+        asm.push_str("    \n");
+        asm.push_str("    pop rsi\n");
+        asm.push_str("    pop rdi\n");
+        asm.push_str("    pop rdx\n");
+        asm.push_str("    pop rcx\n");
+        asm.push_str("    ret\n\n");
+        
+        // Data section
+        asm.push_str("    section .data\n");
+        asm.push_str(&self.generate_string_data());
+        
         Ok(asm)
     }
     
@@ -839,18 +1125,20 @@ impl Backend for Linux64Backend {
     
     fn compile_expression(&self, expr: &Expr) -> Result<String, String> {
         match expr {
-            Expr::Number(n, _) => Ok(format!("    mov rax, {}\n    ; Number expression\n", n)),
-            Expr::Call { func, args: _, kwargs: _, span: _ } if func == "print" => {
-                // Real Linux print implementation
-                let print_code = r#"
-    ; Print using write syscall
-    mov rax, 1        ; sys_write
-    mov rdi, 1        ; stdout
-    lea rsi, [msg]
-    mov rdx, 13       ; length
-    syscall
-"#;
-                Ok(print_code.to_string())
+            Expr::Number(n, _) => Ok(format!("    ; Number: {}\n    mov rax, {}\n", n, n)),
+            Expr::String(s, _) => {
+                let label = self.get_string_label(s);
+                Ok(format!(
+                    "    ; String: '{}'\n    mov rsi, {}\n    call print_string\n",
+                    s, label
+                ))
+            }
+            Expr::Call { func, args, kwargs: _, span: _ } if func == "print" => {
+                if let Some(arg) = args.get(0) {
+                    self.compile_expression(arg)
+                } else {
+                    Ok("    ; Empty print\n".to_string())
+                }
             }
             _ => Ok(format!("    ; {:?}\n", expr)),
         }
@@ -859,11 +1147,39 @@ impl Backend for Linux64Backend {
 
 // ========== WINDOWS 64-BIT BACKEND ==========
 
-pub struct Windows64Backend;
+pub struct Windows64Backend {
+    string_counter: RefCell<u32>,
+    string_literals: RefCell<HashMap<String, String>>,
+}
 
 impl Windows64Backend {
     pub fn new() -> Self {
-        Self
+        Self {
+            string_counter: RefCell::new(0),
+            string_literals: RefCell::new(HashMap::new()),
+        }
+    }
+    
+    fn get_string_label(&self, content: &str) -> String {
+        let mut literals = self.string_literals.borrow_mut();
+        if let Some(label) = literals.get(content) {
+            return label.clone();
+        }
+        
+        let mut counter = self.string_counter.borrow_mut();
+        let label = format!("str_{}", *counter);
+        *counter += 1;
+        literals.insert(content.to_string(), label.clone());
+        label
+    }
+    
+    fn generate_string_data(&self) -> String {
+        let literals = self.string_literals.borrow();
+        let mut data = String::new();
+        for (content, label) in &*literals {
+            data.push_str(&format!("{} db '{}', 0\n", label, content.replace("'", "''")));
+        }
+        data
     }
 }
 
@@ -916,7 +1232,7 @@ impl Backend for Windows64Backend {
         asm.push_str("    call ExitProcess\n");
         
         asm.push_str("\n    section .data\n");
-        asm.push_str("msg_hello db 'Hello from Rython!', 0\n");
+        asm.push_str(&self.generate_string_data());
         
         Ok(asm)
     }
@@ -931,66 +1247,37 @@ impl Backend for Windows64Backend {
     
     fn compile_expression(&self, expr: &Expr) -> Result<String, String> {
         match expr {
-            Expr::Number(n, _) => Ok(format!("    mov rax, {}\n    ; Number expression\n", n)),
-            Expr::Call { func, args: _, kwargs: _, span: _ } if func == "print" => {
-                // Real Windows print implementation
-                let print_code = r#"
-    ; Windows printf call
-    lea rcx, [msg_hello]
-    sub rsp, 32       ; Shadow space
-    call printf
-    add rsp, 32
-"#;
-                Ok(print_code.to_string())
+            Expr::Number(n, _) => Ok(format!("    ; Number: {}\n    mov rax, {}\n", n, n)),
+            Expr::String(s, _) => {
+                let label = self.get_string_label(s);
+                Ok(format!(
+                    "    ; String: '{}'\n    lea rcx, [{}]\n    sub rsp, 32\n    call printf\n    add rsp, 32\n",
+                    s, label
+                ))
+            }
+            Expr::Call { func, args, kwargs: _, span: _ } if func == "print" => {
+                if let Some(arg) = args.get(0) {
+                    self.compile_expression(arg)
+                } else {
+                    Ok("    ; Empty print\n".to_string())
+                }
             }
             _ => Ok(format!("    ; {:?}\n", expr)),
         }
     }
 }
 
-// ========== BACKEND REGISTRY ==========
-
-pub struct BackendRegistry {
-    pub backends: Vec<Box<dyn Backend>>,
+// Helper trait for string hashing
+trait HashCode {
+    fn hash_code(&self) -> u64;
 }
 
-impl BackendRegistry {
-    pub fn new() -> Self {
-        Self {
-            backends: Vec::new(),
+impl HashCode for str {
+    fn hash_code(&self) -> u64 {
+        let mut hash: u64 = 5381;
+        for &byte in self.as_bytes() {
+            hash = ((hash << 5).wrapping_add(hash)).wrapping_add(byte as u64);
         }
-    }
-    
-    pub fn register(&mut self, backend: Box<dyn Backend>) {
-        self.backends.push(backend);
-    }
-    
-    pub fn find_backend(&self, module: &BackendModule) -> Option<&dyn Backend> {
-        self.backends.iter()
-            .find(|b| {
-                b.can_compile(module) && self.capabilities_match(b.as_ref(), &module.required_capabilities)
-            })
-            .map(|b| b.as_ref())
-    }
-
-    fn capabilities_match(&self, backend: &dyn Backend, module_caps: &[Capability]) -> bool {
-        let backend_caps = backend.supported_capabilities();
-        module_caps.iter().all(|cap| backend_caps.contains(cap))
-    }
-    
-    pub fn default_registry() -> Self {
-        let mut registry = Self::new();
-        
-        // Register all available backends
-        registry.register(Box::new(Bios16Backend::new()));
-        registry.register(Box::new(Bios32Backend::new()));
-        registry.register(Box::new(Bios64Backend::new()));
-        registry.register(Box::new(Bios64Backend::new().with_sse()));
-        registry.register(Box::new(Bios64Backend::new().with_avx()));
-        registry.register(Box::new(Bios64Backend::new().with_avx512()));
-        registry.register(Box::new(Linux64Backend::new()));
-        registry.register(Box::new(Windows64Backend::new()));
-        
-        registry
+        hash
     }
 }
