@@ -1145,11 +1145,21 @@ impl Backend for Linux64Backend {
     }
 }
 
+// Add this struct to track variables
+#[derive(Debug, Clone)]
+pub struct VariableInfo {
+    pub name: String,
+    pub offset: i32,  // Negative offset from rbp
+    pub type_hint: Option<String>,
+}
+
 // ========== WINDOWS 64-BIT BACKEND ==========
 
 pub struct Windows64Backend {
     string_counter: RefCell<u32>,
     string_literals: RefCell<HashMap<String, String>>,
+    symbol_table: RefCell<HashMap<String, VariableInfo>>,
+    current_stack_offset: RefCell<i32>,
 }
 
 impl Windows64Backend {
@@ -1157,7 +1167,37 @@ impl Windows64Backend {
         Self {
             string_counter: RefCell::new(0),
             string_literals: RefCell::new(HashMap::new()),
+            symbol_table: RefCell::new(HashMap::new()),
+            current_stack_offset: RefCell::new(8), // Start at rbp-8
         }
+    }
+    
+    fn allocate_variable(&self, _name: &str) -> i32 {
+        let mut offset = self.current_stack_offset.borrow_mut();
+        let current = *offset;
+        *offset += 8; // Each variable takes 8 bytes (64-bit pointer)
+        current
+    }
+    
+    fn get_variable_offset(&self, name: &str) -> Option<i32> {
+        self.symbol_table.borrow().get(name).map(|v| v.offset)
+    }
+    
+    fn ensure_variable_exists(&self, name: &str) -> i32 {
+        if let Some(offset) = self.get_variable_offset(name) {
+            offset
+        } else {
+            self.allocate_variable(name)
+        }
+    }
+    
+    fn generate_string_data(&self) -> String {
+        let literals = self.string_literals.borrow();
+        let mut data = String::new();
+        for (content, label) in &*literals {
+            data.push_str(&format!("{} db '{}', 0\n", label, content.replace("'", "''")));
+        }
+        data
     }
     
     fn get_string_label(&self, content: &str) -> String {
@@ -1173,13 +1213,20 @@ impl Windows64Backend {
         label
     }
     
-    fn generate_string_data(&self) -> String {
-        let literals = self.string_literals.borrow();
-        let mut data = String::new();
-        for (content, label) in &*literals {
-            data.push_str(&format!("{} db '{}', 0\n", label, content.replace("'", "''")));
+    fn count_variables(&self, program: &Program) -> usize {
+        let mut count = 0;
+        for stmt in &program.body {
+            match stmt {           
+                Statement::Assign { target, .. } => {
+                    // Only count if not already counted
+                    if !self.symbol_table.borrow().contains_key(target) {
+                        count += 1;
+                    }
+                }
+                _ => {}
+            }
         }
-        data
+        count
     }
 }
 
@@ -1214,24 +1261,134 @@ impl Backend for Windows64Backend {
         asm.push_str("    section .text\n");
         asm.push_str("    extern ExitProcess\n");
         asm.push_str("    extern printf\n");
+        asm.push_str("    extern putchar\n");
         asm.push_str("    global main\n\n");
         
         asm.push_str("main:\n");
-        asm.push_str("    sub rsp, 8 * (4 + 1)  ; Allocate shadow space + one QWORD for alignment\n");
+        asm.push_str("    push rbp\n");
+        asm.push_str("    mov rbp, rsp\n");
+        
+        // Allocate space for variables (calculate based on number of variables)
+        let var_count = self.count_variables(program);
+        let stack_size = 32 + (var_count * 8); // Shadow space + variables
+        asm.push_str(&format!("    sub rsp, {}          ; Allocate shadow space and variable space\n", stack_size));
+        asm.push_str("    and rsp, -16         ; Align stack to 16 bytes\n\n");
         
         // Compile statements
         for stmt in &program.body {
-            if let Statement::Expr(expr) = stmt {
-                asm.push_str(&self.compile_expression(expr)?);
+            match stmt {
+                Statement::Expr(expr) => {
+                    asm.push_str(&self.compile_expression(expr)?);
+                }
+                Statement::VarDecl { name, value, type_hint: _, span: _ } => {
+                    // Allocate space for variable
+                    let offset = self.allocate_variable(name);
+                    self.symbol_table.borrow_mut().insert(name.clone(), VariableInfo {
+                        name: name.clone(),
+                        offset,
+                        type_hint: None,
+                    });
+                    
+                    // Compile the value
+                    asm.push_str(&format!("    ; Variable declaration: {}\n", name));
+                    asm.push_str(&self.compile_expression(value)?);
+                    
+                    // Store the value at [rbp - offset]
+                    asm.push_str(&format!("    mov [rbp - {}], rax\n", offset));
+                }
+                Statement::Assign { target, value, span: _ } => {
+                    // Ensure variable exists (allocate if not)
+                    let offset = self.ensure_variable_exists(target);
+                    
+                    // If the variable wasn't already in the symbol table, add it
+                    if !self.symbol_table.borrow().contains_key(target) {
+                        self.symbol_table.borrow_mut().insert(target.clone(), VariableInfo {
+                            name: target.clone(),
+                            offset,
+                            type_hint: None,
+                        });
+                    }
+                    
+                    // Compile the value
+                    asm.push_str(&format!("    ; Assignment: {} = ...\n", target));
+                    asm.push_str(&self.compile_expression(value)?);
+                    
+                    // Store the value at [rbp - offset]
+                    asm.push_str(&format!("    mov [rbp - {}], rax\n", offset));
+                }
+                _ => {
+                    asm.push_str("    ; [Unsupported statement]\n");
+                }
             }
         }
         
         // Windows exit
-        asm.push_str("    ; Exit\n");
+        asm.push_str("\n    ; Exit\n");
         asm.push_str("    xor ecx, ecx          ; exit code 0\n");
         asm.push_str("    call ExitProcess\n");
         
-        asm.push_str("\n    section .data\n");
+        // Helper function to convert integer to string
+        asm.push_str("\n; Helper function to convert integer to string\n");
+        asm.push_str("int_to_string:\n");
+        asm.push_str("    ; Input: rax = integer\n");
+        asm.push_str("    ; Output: rdi = pointer to null-terminated string\n");
+        asm.push_str("    push rbp\n");
+        asm.push_str("    mov rbp, rsp\n");
+        asm.push_str("    sub rsp, 32          ; Allocate space for local buffer\n");
+        asm.push_str("    \n");
+        asm.push_str("    ; Point rdi to end of buffer\n");
+        asm.push_str("    lea rdi, [rbp - 32 + 30]\n");
+        asm.push_str("    mov byte [rdi], 0    ; Null terminator\n");
+        asm.push_str("    \n");
+        asm.push_str("    ; Handle negative numbers\n");
+        asm.push_str("    test rax, rax\n");
+        asm.push_str("    jns .positive\n");
+        asm.push_str("    neg rax\n");
+        asm.push_str("    mov byte [rbp - 32 + 29], '-'\n");
+        asm.push_str("    dec rdi\n");
+        asm.push_str("    mov byte [rdi], '-'\n");
+        asm.push_str("    \n");
+        asm.push_str(".positive:\n");
+        asm.push_str("    mov rbx, 10          ; Base 10\n");
+        asm.push_str("    \n");
+        asm.push_str(".convert_loop:\n");
+        asm.push_str("    xor rdx, rdx\n");
+        asm.push_str("    div rbx\n");
+        asm.push_str("    add dl, '0'\n");
+        asm.push_str("    dec rdi\n");
+        asm.push_str("    mov [rdi], dl\n");
+        asm.push_str("    test rax, rax\n");
+        asm.push_str("    jnz .convert_loop\n");
+        asm.push_str("    \n");
+        asm.push_str("    ; Return pointer to string\n");
+        asm.push_str("    mov rax, rdi\n");
+        asm.push_str("    leave\n");
+        asm.push_str("    ret\n\n");
+        
+        // Print newline function
+        asm.push_str("; Print newline function\n");
+        asm.push_str("print_newline:\n");
+        asm.push_str("    push rcx\n");
+        asm.push_str("    push rdx\n");
+        asm.push_str("    push r8\n");
+        asm.push_str("    push r9\n");
+        asm.push_str("    sub rsp, 32          ; Shadow space\n");
+        asm.push_str("    \n");
+        asm.push_str("    mov rcx, 10          ; ASCII code for newline\n");
+        asm.push_str("    call putchar\n");
+        asm.push_str("    \n");
+        asm.push_str("    add rsp, 32\n");
+        asm.push_str("    pop r9\n");
+        asm.push_str("    pop r8\n");
+        asm.push_str("    pop rdx\n");
+        asm.push_str("    pop rcx\n");
+        asm.push_str("    ret\n\n");
+        
+        asm.push_str("    section .data\n");
+        asm.push_str("printf_format_string:\n");
+        asm.push_str("    db '%s', 0           ; printf format string for strings\n");
+        asm.push_str("printf_format_int:\n");
+        asm.push_str("    db '%d', 0           ; printf format string for integers\n\n");
         asm.push_str(&self.generate_string_data());
         
         Ok(asm)
@@ -1246,24 +1403,138 @@ impl Backend for Windows64Backend {
     }
     
     fn compile_expression(&self, expr: &Expr) -> Result<String, String> {
+        let mut code = String::new();
+        
         match expr {
-            Expr::Number(n, _) => Ok(format!("    ; Number: {}\n    mov rax, {}\n", n, n)),
+            Expr::Number(n, _) => {
+                code.push_str(&format!("    ; Number: {}\n", n));
+                code.push_str(&format!("    mov rax, {}\n", n));
+                
+                // For Windows, we need to pass the number correctly to printf
+                // We'll use the %d format specifier for integers
+                code.push_str("    mov rdx, rax          ; Second arg: integer value\n");
+                code.push_str("    lea rcx, [printf_format_int] ; First arg: format string for integer\n");
+                code.push_str("    sub rsp, 32          ; Allocate shadow space\n");
+                code.push_str("    xor rax, rax          ; No floating point args\n");
+                code.push_str("    call printf\n");
+                code.push_str("    add rsp, 32          ; Clean up shadow space\n");
+                
+                // Automatically add newline after print
+                code.push_str("    call print_newline\n");
+            }
             Expr::String(s, _) => {
                 let label = self.get_string_label(s);
-                Ok(format!(
-                    "    ; String: '{}'\n    lea rcx, [{}]\n    sub rsp, 32\n    call printf\n    add rsp, 32\n",
-                    s, label
-                ))
+                code.push_str(&format!("    ; String: '{}'\n", s));
+                code.push_str(&format!("    lea rax, [{}]\n", label));
+                
+                // For strings, use %s format specifier
+                code.push_str("    mov rdx, rax          ; Second arg: string address\n");
+                code.push_str("    lea rcx, [printf_format_string] ; First arg: format string for string\n");
+                code.push_str("    sub rsp, 32          ; Allocate shadow space\n");
+                code.push_str("    xor rax, rax          ; No floating point args\n");
+                code.push_str("    call printf\n");
+                code.push_str("    add rsp, 32          ; Clean up shadow space\n");
+                
+                // Automatically add newline after print
+                code.push_str("    call print_newline\n");
+            }
+            Expr::Var(name, _) => {
+                // Look up variable offset
+                let offset = self.get_variable_offset(name)
+                    .ok_or_else(|| format!("Undefined variable: {}", name))?;
+                
+                code.push_str(&format!("    ; Variable: {}\n", name));
+                code.push_str(&format!("    mov rax, [rbp - {}]\n", offset));
+                
+                // For variables, we need to determine if they're strings or numbers
+                // For now, assume they're numbers and use the int_to_string helper
+                code.push_str("    call int_to_string    ; Convert integer to string\n");
+                code.push_str("    mov rdx, rax          ; Second arg: string address\n");
+                code.push_str("    lea rcx, [printf_format_string] ; First arg: format string\n");
+                code.push_str("    sub rsp, 32          ; Allocate shadow space\n");
+                code.push_str("    xor rax, rax          ; No floating point args\n");
+                code.push_str("    call printf\n");
+                code.push_str("    add rsp, 32          ; Clean up shadow space\n");
+                
+                // Automatically add newline after print
+                code.push_str("    call print_newline\n");
             }
             Expr::Call { func, args, kwargs: _, span: _ } if func == "print" => {
                 if let Some(arg) = args.get(0) {
-                    self.compile_expression(arg)
+                    // Handle each type of argument differently
+                    match arg {
+                        Expr::Number(_, _) | Expr::BinOp { .. } => {
+                            // Compile the argument as a number
+                            code.push_str(&self.compile_expression(arg)?);
+                            
+                            // The number is already in rax, so we can just print it
+                            code.push_str("    mov rdx, rax          ; Second arg: integer value\n");
+                            code.push_str("    lea rcx, [printf_format_int] ; First arg: format string for integer\n");
+                            code.push_str("    sub rsp, 32          ; Allocate shadow space\n");
+                            code.push_str("    xor rax, rax          ; No floating point args\n");
+                            code.push_str("    call printf\n");
+                            code.push_str("    add rsp, 32          ; Clean up shadow space\n");
+                            
+                            // Automatically add newline after print
+                            code.push_str("    call print_newline\n");
+                        }
+                        Expr::String(_, _) => {
+                            // Compile the string (which already includes newline)
+                            code.push_str(&self.compile_expression(arg)?);
+                        }
+                        Expr::Var(_, _) => {
+                            // For variables, we need to check their type
+                            // For now, compile and let the variable handling code deal with it
+                            code.push_str(&self.compile_expression(arg)?);
+                        }
+                        _ => {
+                            return Err(format!("Unsupported print argument type: {:?}", arg));
+                        }
+                    }
                 } else {
-                    Ok("    ; Empty print\n".to_string())
+                    // Empty print() - just print a newline
+                    code.push_str("    ; Empty print - just newline\n");
+                    code.push_str("    call print_newline\n");
                 }
             }
-            _ => Ok(format!("    ; {:?}\n", expr)),
+            Expr::BinOp { left, op, right, span: _ } => {
+                // Compile left side
+                code.push_str(&self.compile_expression(left)?);
+                code.push_str("    push rax\n");
+                
+                // Compile right side
+                code.push_str(&self.compile_expression(right)?);
+                code.push_str("    mov rbx, rax\n");
+                code.push_str("    pop rax\n");
+                
+                match op {
+                    crate::parser::Op::Add => {
+                        code.push_str("    add rax, rbx\n");
+                    }
+                    crate::parser::Op::Sub => {
+                        code.push_str("    sub rax, rbx\n");
+                    }
+                    crate::parser::Op::Mul => {
+                        code.push_str("    imul rax, rbx\n");
+                    }
+                    crate::parser::Op::Div => {
+                        code.push_str("    xor rdx, rdx\n");
+                        code.push_str("    idiv rbx\n");
+                    }
+                    _ => {
+                        return Err(format!("Unsupported operator: {:?}", op));
+                    }
+                }
+                
+                // For binary operations, the result is in rax
+                // We'll leave it there for now, and the print handler will deal with it
+            }
+            _ => {
+                return Err(format!("Unsupported expression: {:?}", expr));
+            }
         }
+        
+        Ok(code)
     }
 }
 

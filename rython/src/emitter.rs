@@ -1,5 +1,5 @@
-use crate::parser::{Program, Statement, Expr};
 use std::collections::HashMap;
+use crate::parser::{Program, Statement, Expr, Op}; 
 
 // ========== TARGET CONFIGURATION ==========
 
@@ -49,6 +49,8 @@ pub struct NasmEmitter {
     label_counter: u32,
     variable_offsets: HashMap<String, i32>,
     byte_counter: ByteCounter,
+    string_literals: HashMap<String, String>, // Maps Rython string to NASM label
+    data_labels: Vec<String>, // Track data section labels
 }
 
 impl NasmEmitter {
@@ -58,6 +60,8 @@ impl NasmEmitter {
             label_counter: 0,
             variable_offsets: HashMap::new(),
             byte_counter: ByteCounter::new(),
+            string_literals: HashMap::new(),
+            data_labels: Vec::new(),
         }
     }
     
@@ -71,6 +75,83 @@ impl NasmEmitter {
     pub fn set_target_bios64_avx(&mut self) { self.target = TargetConfig::bios64_avx(); }
     pub fn set_target_bios64_avx512(&mut self) { self.target = TargetConfig::bios64_avx512(); }
     
+    fn new_label(&mut self, prefix: &str) -> String {
+        let label = format!("{}_{}", prefix, self.label_counter);
+        self.label_counter += 1;
+        label
+    }
+    
+    // Collect all string literals from the program
+    fn collect_string_literals(&mut self, program: &Program) {
+        self.string_literals.clear();
+        self.data_labels.clear();
+        
+        for stmt in &program.body {
+            self.collect_strings_from_stmt(stmt);
+        }
+    }
+    
+    fn collect_strings_from_stmt(&mut self, stmt: &Statement) {
+        match stmt {
+            Statement::Expr(expr) => self.collect_strings_from_expr(expr),
+            Statement::VarDecl { value, .. } => self.collect_strings_from_expr(value),
+            Statement::Assign { value, .. } => self.collect_strings_from_expr(value),
+            Statement::FunctionDef { body, .. } => {
+                for stmt in body {
+                    self.collect_strings_from_stmt(stmt);
+                }
+            }
+            Statement::If { condition, then_block, elif_blocks, else_block, .. } => {
+                self.collect_strings_from_expr(condition);
+                for stmt in then_block {
+                    self.collect_strings_from_stmt(stmt);
+                }
+                for (cond, block) in elif_blocks {
+                    self.collect_strings_from_expr(cond);
+                    for stmt in block {
+                        self.collect_strings_from_stmt(stmt);
+                    }
+                }
+                if let Some(else_block) = else_block {
+                    for stmt in else_block {
+                        self.collect_strings_from_stmt(stmt);
+                    }
+                }
+            }
+            Statement::Return(value) => {
+                if let Some(expr) = value {
+                    self.collect_strings_from_expr(expr);
+                }
+            }
+            _ => {}
+        }
+    }
+    
+    fn collect_strings_from_expr(&mut self, expr: &Expr) {
+        match expr {
+            Expr::String(s, _) => {
+                if !self.string_literals.contains_key(s) {
+                    let label = self.new_label("str");
+                    self.string_literals.insert(s.clone(), label.clone());
+                    self.data_labels.push(label);
+                }
+            }
+            Expr::Call { args, .. } => {
+                for arg in args {
+                    self.collect_strings_from_expr(arg);
+                }
+            }
+            Expr::BinOp { left, right, .. } => {
+                self.collect_strings_from_expr(left);
+                self.collect_strings_from_expr(right);
+            }
+            Expr::UnaryOp { operand, .. } => {
+                self.collect_strings_from_expr(operand);
+            }
+            _ => {}
+        }
+    }
+    
     // Check if program has imports
     fn has_imports(&self, program: &Program) -> bool {
         program.body.iter().any(|stmt| {
@@ -81,29 +162,35 @@ impl NasmEmitter {
         })
     }
     
-    // Process imports and return filtered program and library assembly
-    fn process_imports(&self, program: &Program) -> Result<(Program, String), String> {
-        use crate::rcl_compiler::AutoImportResolver;
-        
-        let target_str = match self.target.platform {
-            TargetPlatform::Bios16 => "bios16",
-            TargetPlatform::Bios32 => "bios32",
-            TargetPlatform::Bios64 | TargetPlatform::Bios64SSE | 
-            TargetPlatform::Bios64AVX | TargetPlatform::Bios64AVX512 => "bios64",
-            TargetPlatform::Linux64 => "linux64",
-            TargetPlatform::Windows64 => "windows64",
-        };
-        
-        let mut resolver = AutoImportResolver::new();
-        
-        // Generate library assembly
-        let library_asm = resolver.generate_import_assembly(program, target_str)
-            .map_err(|e| format!("Import error: {}", e))?;
-        
-        // Get program without imports
-        let filtered_program = resolver.create_program_without_imports(program);
-        
-        Ok((filtered_program, library_asm))
+    // Variable management methods
+    fn allocate_variable(&mut self, name: &str) -> i32 {
+        let offset = (self.variable_offsets.len() as i32 + 1) * 8;
+        self.variable_offsets.insert(name.to_string(), offset);
+        offset
+    }
+    
+    fn get_variable_offset(&self, name: &str) -> Option<i32> {
+        self.variable_offsets.get(name).copied()
+    }
+    
+    fn count_variables(&self, program: &Program) -> usize {
+        let mut count = 0;
+        for stmt in &program.body {
+            match stmt {
+                Statement::VarDecl { name, .. } => {
+                    if !self.variable_offsets.contains_key(name) {
+                        count += 1;
+                    }
+                }
+                Statement::Assign { target, .. } => {
+                    if !self.variable_offsets.contains_key(target) {
+                        count += 1;
+                    }
+                }
+                _ => {}
+            }
+        }
+        count
     }
     
     // Main compilation
@@ -111,6 +198,7 @@ impl NasmEmitter {
         self.label_counter = 0;
         self.variable_offsets.clear();
         self.byte_counter.reset();
+        self.collect_string_literals(program);
         
         // Check for imports first
         if self.has_imports(program) {
@@ -124,34 +212,470 @@ impl NasmEmitter {
         }
     }
     
-    // Compile with automatic import handling
-    fn compile_with_imports(&mut self, program: &Program) -> Result<String, String> {
-        match self.process_imports(program) {
-            Ok((filtered_program, library_asm)) => {
-                // Compile main program
-                let main_asm = if self.target.is_bios() {
-                    self.compile_bios(&filtered_program)?
-                } else {
-                    self.compile_standard(&filtered_program)?
-                };
-                
-                // Combine with library assembly
-                if !library_asm.is_empty() {
-                    Ok(format!("{}\n\n; ========== IMPORTED LIBRARIES ==========\n\n{}", main_asm, library_asm))
-                } else {
-                    Ok(main_asm)
+    // WINDOWS 64-BIT COMPILATION
+    fn compile_windows64(&mut self, program: &Program) -> Result<String, String> {
+        let var_count = self.count_variables(program);
+        let stack_space = 32 + (var_count * 8); // Shadow space + variables
+        
+        let mut code = String::new();
+        
+        code.push_str("; Rython Windows 64-bit Executable\n");
+        code.push_str("; Format: Win64 (PE executable)\n\n");
+        
+        // Define sections for PE executable
+        code.push_str("section .text\n");
+        code.push_str("    bits 64\n");
+        code.push_str("    default rel\n\n"); // RIP-relative addressing by default
+        
+        // Entry point for Windows (will be called by CRT)
+        code.push_str("global main\n");
+        
+        // Import external functions from Windows DLLs
+        code.push_str("extern GetStdHandle\n");
+        code.push_str("extern WriteConsoleA\n");
+        code.push_str("extern ExitProcess\n");
+        code.push_str("extern printf\n");
+        code.push_str("extern puts\n");
+        code.push_str("extern strlen\n\n");
+        
+        // Main function
+        code.push_str("main:\n");
+        code.push_str("    push rbp\n");
+        code.push_str("    mov rbp, rsp\n");
+        code.push_str(&format!("    sub rsp, {}          ; Allocate shadow space + variable space\n", stack_space));
+        code.push_str("    and rsp, -16         ; Align stack to 16 bytes (Windows requirement)\n\n");
+        
+        // Compile program statements
+        self.compile_windows64_statements(&mut code, &program.body)?;
+        
+        // Exit with success code
+        code.push_str("    xor eax, eax         ; Return 0\n");
+        code.push_str("    leave\n");
+        code.push_str("    ret\n\n");
+        
+        // Windows helper functions
+        code.push_str("; ========== WINDOWS HELPERS ==========\n\n");
+        
+        // Print string using WriteConsole
+        code.push_str("win_print:\n");
+        code.push_str("    ; RDI = string pointer\n");
+        code.push_str("    push rdi\n");
+        code.push_str("    push rsi\n");
+        code.push_str("    push rdx\n");
+        code.push_str("    push rcx\n");
+        code.push_str("    push r8\n");
+        code.push_str("    push r9\n");
+        code.push_str("    sub rsp, 40\n");
+        code.push_str("    \n");
+        code.push_str("    ; Get stdout handle\n");
+        code.push_str("    mov rcx, -11         ; STD_OUTPUT_HANDLE\n");
+        code.push_str("    call GetStdHandle\n");
+        code.push_str("    mov rdx, rax        ; hConsoleOutput\n");
+        code.push_str("    \n");
+        code.push_str("    ; Calculate string length\n");
+        code.push_str("    mov rcx, rdi\n");
+        code.push_str("    call strlen\n");
+        code.push_str("    \n");
+        code.push_str("    ; Write to console\n");
+        code.push_str("    mov rcx, rdx        ; hConsoleOutput\n");
+        code.push_str("    mov rdx, rdi        ; lpBuffer\n");
+        code.push_str("    mov r8, rax         ; nNumberOfCharsToWrite\n");
+        code.push_str("    lea r9, [rsp+80]    ; lpNumberOfCharsWritten\n");
+        code.push_str("    mov qword [rsp+32], 0 ; lpReserved\n");
+        code.push_str("    call WriteConsoleA\n");
+        code.push_str("    \n");
+        code.push_str("    add rsp, 40\n");
+        code.push_str("    pop r9\n");
+        code.push_str("    pop r8\n");
+        code.push_str("    pop rcx\n");
+        code.push_str("    pop rdx\n");
+        code.push_str("    pop rsi\n");
+        code.push_str("    pop rdi\n");
+        code.push_str("    ret\n\n");
+        
+        // Print number using printf
+        code.push_str("win_print_number:\n");
+        code.push_str("    ; RDI = number\n");
+        code.push_str("    push rdi\n");
+        code.push_str("    push rsi\n");
+        code.push_str("    sub rsp, 40\n");
+        code.push_str("    \n");
+        code.push_str("    lea rcx, [win_fmt_int]\n");
+        code.push_str("    mov rdx, rdi\n");
+        code.push_str("    xor rax, rax        ; No floating point args\n");
+        code.push_str("    call printf\n");
+        code.push_str("    \n");
+        code.push_str("    add rsp, 40\n");
+        code.push_str("    pop rsi\n");
+        code.push_str("    pop rdi\n");
+        code.push_str("    ret\n\n");
+        
+        // Data section for Windows
+        code.push_str("section .data\n");
+        
+        // Format strings
+        code.push_str("win_fmt_int: db '%d', 10, 0   ; %%d + newline + null\n");
+        code.push_str("win_fmt_str: db '%s', 0\n");
+        
+        // String literals
+        for (string, label) in &self.string_literals {
+            code.push_str(&format!("{}: db '{}', 0\n", label, string));
+        }
+        
+        Ok(code)
+    }
+    
+    // LINUX 64-BIT COMPILATION
+    fn compile_linux64(&mut self, program: &Program) -> Result<String, String> {
+        let mut code = String::new();
+        
+        code.push_str("; Rython Linux 64-bit Executable\n");
+        code.push_str("; Format: ELF64\n\n");
+        
+        code.push_str("section .text\n");
+        code.push_str("    bits 64\n");
+        code.push_str("    global _start\n\n");
+        
+        code.push_str("_start:\n");
+        code.push_str("    ; Linux syscall calling convention: rax=syscall#, rdi, rsi, rdx, r10, r8, r9\n\n");
+        
+        // Compile program statements
+        self.compile_linux64_statements(&mut code, &program.body)?;
+        
+        // Exit program
+        code.push_str("    ; Exit with code 0\n");
+        code.push_str("    mov rax, 60         ; sys_exit\n");
+        code.push_str("    xor rdi, rdi        ; exit code 0\n");
+        code.push_str("    syscall\n\n");
+        
+        // Linux syscall helpers
+        code.push_str("; ========== LINUX HELPERS ==========\n\n");
+        
+        code.push_str("linux_print:\n");
+        code.push_str("    ; RDI = string pointer\n");
+        code.push_str("    push rdi\n");
+        code.push_str("    push rsi\n");
+        code.push_str("    push rdx\n");
+        code.push_str("    push rax\n");
+        code.push_str("    \n");
+        code.push_str("    ; Calculate length\n");
+        code.push_str("    mov rsi, rdi\n");
+        code.push_str("    xor rdx, rdx\n");
+        code.push_str(".len_loop:\n");
+        code.push_str("    cmp byte [rsi + rdx], 0\n");
+        code.push_str("    je .len_done\n");
+        code.push_str("    inc rdx\n");
+        code.push_str("    jmp .len_loop\n");
+        code.push_str(".len_done:\n");
+        code.push_str("    \n");
+        code.push_str("    ; Write to stdout\n");
+        code.push_str("    mov rax, 1          ; sys_write\n");
+        code.push_str("    mov rdi, 1          ; fd = stdout\n");
+        code.push_str("    ; rsi already set to buffer\n");
+        code.push_str("    ; rdx already set to count\n");
+        code.push_str("    syscall\n");
+        code.push_str("    \n");
+        code.push_str("    pop rax\n");
+        code.push_str("    pop rdx\n");
+        code.push_str("    pop rsi\n");
+        code.push_str("    pop rdi\n");
+        code.push_str("    ret\n\n");
+        
+        // Data section
+        code.push_str("section .data\n");
+        
+        // String literals
+        for (string, label) in &self.string_literals {
+            code.push_str(&format!("{}: db '{}', 10, 0\n", label, string)); // Add newline for Linux
+        }
+        
+        Ok(code)
+    }
+    
+    fn compile_windows64_statements(&mut self, code: &mut String, statements: &[Statement]) -> Result<(), String> {
+        for stmt in statements {
+            match stmt {
+                Statement::Expr(expr) => {
+                    let expr_code = self.compile_windows64_expression_to_string(expr)?;
+                    code.push_str(&expr_code);
+                }
+                Statement::VarDecl { name, value, .. } => {
+                    // Allocate space for variable
+                    let offset = self.allocate_variable(name);
+                    
+                    code.push_str("    ; var ");
+                    code.push_str(name);
+                    code.push_str(" = \n");
+                    
+                    // Compile the value
+                    let expr_code = self.compile_windows64_expression_to_string(value)?;
+                    code.push_str(&expr_code);
+                    
+                    // Store value at [rbp - offset]
+                    code.push_str(&format!("    mov [rbp - {}], rax\n", offset));
+                }
+                Statement::Assign { target, value, .. } => {
+                    // Get variable offset (allocate if not exists)
+                    let offset = if let Some(offset) = self.get_variable_offset(target) {
+                        offset
+                    } else {
+                        self.allocate_variable(target)
+                    };
+                    
+                    code.push_str("    ; ");
+                    code.push_str(target);
+                    code.push_str(" = \n");
+                    
+                    // Compile the value
+                    let expr_code = self.compile_windows64_expression_to_string(value)?;
+                    code.push_str(&expr_code);
+                    
+                    // Store value at [rbp - offset]
+                    code.push_str(&format!("    mov [rbp - {}], rax\n", offset));
+                }
+                Statement::FunctionDef { name, args: params, body, .. } => {
+                    code.push_str(&format!("\n{}:\n", name));
+                    code.push_str("    push rbp\n");
+                    code.push_str("    mov rbp, rsp\n");
+                    
+                    // Allocate space for parameters
+                    let param_space = params.len() * 8;
+                    code.push_str(&format!("    sub rsp, {}\n", param_space + 32));
+                    
+                    // Store parameters
+                    for (i, param) in params.iter().enumerate() {
+                        let offset = (i as i32 + 1) * 8;
+                        self.variable_offsets.insert(param.clone(), offset);
+                    }
+                    
+                    // Compile function body
+                    self.compile_windows64_statements(code, body)?;
+                    
+                    code.push_str("    leave\n");
+                    code.push_str("    ret\n\n");
+                }
+                Statement::Return(value) => {
+                    if let Some(expr) = value {
+                        let expr_code = self.compile_windows64_expression_to_string(expr)?;
+                        code.push_str(&expr_code);
+                    }
+                    code.push_str("    leave\n");
+                    code.push_str("    ret\n");
+                }
+                Statement::If { condition, then_block, elif_blocks, else_block, .. } => {
+                    let else_label = self.new_label("else");
+                    let end_label = self.new_label("endif");
+                    
+                    // Compile condition
+                    let cond_code = self.compile_windows64_expression_to_string(condition)?;
+                    code.push_str(&cond_code);
+                    code.push_str("    test rax, rax\n");
+                    code.push_str(&format!("    jz {}\n", else_label));
+                    
+                    // Compile then block
+                    for stmt in then_block {
+                        if let Statement::Expr(expr) = stmt {
+                            let expr_code = self.compile_windows64_expression_to_string(expr)?;
+                            code.push_str(&expr_code);
+                        }
+                    }
+                    code.push_str(&format!("    jmp {}\n", end_label));
+                    
+                    // Compile elif blocks
+                    code.push_str(&format!("{}:\n", else_label));
+                    for (elif_cond, elif_block) in elif_blocks {
+                        let elif_label = self.new_label("elif");
+                        let cond_code = self.compile_windows64_expression_to_string(elif_cond)?;
+                        code.push_str(&cond_code);
+                        code.push_str("    test rax, rax\n");
+                        code.push_str(&format!("    jz {}\n", elif_label));
+                        
+                        for stmt in elif_block {
+                            if let Statement::Expr(expr) = stmt {
+                                let expr_code = self.compile_windows64_expression_to_string(expr)?;
+                                code.push_str(&expr_code);
+                            }
+                        }
+                        code.push_str(&format!("    jmp {}\n", end_label));
+                        code.push_str(&format!("{}:\n", elif_label));
+                    }
+                    
+                    // Compile else block
+                    if let Some(else_block) = else_block {
+                        for stmt in else_block {
+                            if let Statement::Expr(expr) = stmt {
+                                let expr_code = self.compile_windows64_expression_to_string(expr)?;
+                                code.push_str(&expr_code);
+                            }
+                        }
+                    }
+                    
+                    code.push_str(&format!("{}:\n", end_label));
+                }
+                _ => {
+                    code.push_str("    ; [Unsupported statement type]\n");
                 }
             }
-            Err(e) => {
-                // Fall back to compilation without imports
-                Ok(format!("; Warning: Failed to process imports: {}\n\n{}", e, 
-                    if self.target.is_bios() {
-                        self.compile_bios(program)?
+        }
+        Ok(())
+    }
+    
+    fn compile_windows64_expression_to_string(&mut self, expr: &Expr) -> Result<String, String> {
+        let mut code = String::new();
+        self.compile_windows64_expression(&mut code, expr)?;
+        Ok(code)
+    }
+    
+    fn compile_windows64_expression(&mut self, code: &mut String, expr: &Expr) -> Result<(), String> {
+        match expr {
+            Expr::Number(n, _) => {
+                code.push_str(&format!("    ; Number: {}\n", n));
+                code.push_str(&format!("    mov rax, {}\n", n));
+            }
+            Expr::String(s, _) => {
+                if let Some(label) = self.string_literals.get(s) {
+                    code.push_str(&format!("    ; String: '{}'\n", s));
+                    code.push_str(&format!("    lea rax, [{}]\n", label));
+                } else {
+                    return Err(format!("String literal '{}' not found in data section", s));
+                }
+            }
+            Expr::Var(name, _) => {
+                let offset = self.get_variable_offset(name)
+                    .ok_or_else(|| format!("Undefined variable: {}", name))?;
+                
+                code.push_str(&format!("    ; Variable: {}\n", name));
+                code.push_str(&format!("    mov rax, [rbp - {}]\n", offset));
+            }
+            Expr::Call { func, args, kwargs: _, span: _ } => {
+                // Handle print function specially
+                if func == "print" {
+                    if let Some(arg) = args.get(0) {
+                        // Compile the argument first
+                        self.compile_windows64_expression(code, arg)?;
+                        
+                        // Now rax contains the value to print
+                        // For strings, use printf format
+                        if matches!(arg, Expr::String(_, _) | Expr::Var(_, _)) {
+                            // String or variable (could be string)
+                            code.push_str("    mov rdx, rax          ; Second arg: string address\n");
+                            code.push_str("    lea rcx, [win_fmt_str] ; First arg: format string\n");
+                            code.push_str("    sub rsp, 32          ; Allocate shadow space\n");
+                            code.push_str("    xor rax, rax          ; No floating point args\n");
+                            code.push_str("    call printf\n");
+                            code.push_str("    add rsp, 32          ; Clean up shadow space\n");
+                        } else {
+                            // Number
+                            code.push_str("    mov rdx, rax          ; Second arg: number\n");
+                            code.push_str("    lea rcx, [win_fmt_int] ; First arg: format string\n");
+                            code.push_str("    sub rsp, 32          ; Allocate shadow space\n");
+                            code.push_str("    xor rax, rax          ; No floating point args\n");
+                            code.push_str("    call printf\n");
+                            code.push_str("    add rsp, 32          ; Clean up shadow space\n");
+                        }
                     } else {
-                        self.compile_standard(program)?
-                    }))
+                        code.push_str("    ; Empty print\n");
+                    }
+                } else {
+                    // Regular function call
+                    // Windows calling convention: rcx, rdx, r8, r9, then stack
+                    for (i, arg) in args.iter().enumerate() {
+                        self.compile_windows64_expression(code, arg)?;
+                        match i {
+                            0 => code.push_str("    mov rcx, rax\n"),
+                            1 => code.push_str("    mov rdx, rax\n"),
+                            2 => code.push_str("    mov r8, rax\n"),
+                            3 => code.push_str("    mov r9, rax\n"),
+                            _ => {
+                                code.push_str("    push rax\n");
+                            }
+                        }
+                    }
+                    code.push_str(&format!("    call {}\n", func));
+                    // Clean up stack if more than 4 args
+                    if args.len() > 4 {
+                        code.push_str(&format!("    add rsp, {}\n", (args.len() - 4) * 8));
+                    }
+                }
+            }
+            Expr::BinOp { left, op, right, .. } => {
+                // Compile left side
+                self.compile_windows64_expression(code, left)?;
+                code.push_str("    push rax\n");
+                
+                // Compile right side
+                self.compile_windows64_expression(code, right)?;
+                code.push_str("    mov rbx, rax\n");
+                code.push_str("    pop rax\n");
+                
+                match op {
+                    Op::Add => code.push_str("    add rax, rbx\n"),
+                    Op::Sub => code.push_str("    sub rax, rbx\n"),
+                    Op::Mul => code.push_str("    imul rax, rbx\n"),
+                    Op::Div => {
+                        code.push_str("    xor rdx, rdx\n");
+                        code.push_str("    idiv rbx\n");
+                    }
+                    _ => return Err(format!("Unsupported operator: {:?}", op)),
+                }
+            }
+            Expr::Boolean(b, _) => {
+                code.push_str(&format!("    ; Boolean: {}\n", b));
+                code.push_str(&format!("    mov rax, {}\n", if *b { 1 } else { 0 }));
+            }
+            Expr::Float(f, _) => {
+                code.push_str(&format!("    ; Float: {}\n", f));
+                code.push_str("    ; Float support not implemented\n");
+                code.push_str("    mov rax, 0\n");
+            }
+            Expr::None(_) => {
+                code.push_str("    ; None\n");
+                code.push_str("    xor rax, rax\n");
+            }
+            _ => {
+                code.push_str("    ; [Unsupported expression type]\n");
+                code.push_str("    xor rax, rax\n");
             }
         }
+        Ok(())
+    }
+    
+    fn compile_linux64_statements(&mut self, code: &mut String, statements: &[Statement]) -> Result<(), String> {
+        for stmt in statements {
+            match stmt {
+                Statement::Expr(expr) => {
+                    code.push_str("    ; Expression\n");
+                    // Compile expression
+                    match expr {
+                        Expr::String(s, _) => {
+                            if let Some(label) = self.string_literals.get(s) {
+                                code.push_str(&format!("    ; String: '{}'\n", s));
+                                code.push_str(&format!("    lea rdi, [{}]\n", label));
+                                code.push_str("    call linux_print\n");
+                            } else {
+                                return Err(format!("String literal '{}' not found in data section", s));
+                            }
+                        }
+                        Expr::Call { func, args: _, kwargs: _, span: _ } if func == "print" => {
+                            code.push_str("    ; print statement\n");
+                        }
+                        _ => {
+                            code.push_str("    ; [Expression]\n");
+                        }
+                    }
+                }
+                Statement::VarDecl { name, value: _, .. } => {
+                    code.push_str("    ; var ");
+                    code.push_str(name);
+                    code.push_str(" = \n");
+                    // For Linux, we'd need to implement variable storage
+                }
+                _ => {
+                    code.push_str("    ; [Statement]\n");
+                }
+            }
+        }
+        Ok(())
     }
     
     fn compile_bios(&mut self, program: &Program) -> Result<String, String> {
@@ -349,6 +873,7 @@ impl NasmEmitter {
         code.push_str("    dq 0x00CF9A000000FFFF\n");
         code.push_str("    dq 0x00CF92000000FFFF\n");
         code.push_str("gdt32_end:\n\n");
+        
         code.push_str("gdt32_desc:\n");
         code.push_str("    dw gdt32_end - gdt32 - 1\n");
         code.push_str("    dd gdt32\n\n");
@@ -597,7 +1122,15 @@ impl NasmEmitter {
                     self.compile_bios16_expression(code, expr);
                 }
                 Statement::VarDecl { name, value, .. } => {
-                    code.push_str(&format!("    ; var {} = ", name));
+                    code.push_str("    ; var ");
+                    code.push_str(name);
+                    code.push_str(" = ");
+                    self.compile_bios16_expression(code, value);
+                }
+                Statement::Assign { target, value, .. } => {
+                    code.push_str("    ; ");
+                    code.push_str(target);
+                    code.push_str(" = ");
                     self.compile_bios16_expression(code, value);
                 }
                 _ => code.push_str("    ; [Statement]\n"),
@@ -613,7 +1146,15 @@ impl NasmEmitter {
                     self.compile_bios32_expression(code, expr);
                 }
                 Statement::VarDecl { name, value, .. } => {
-                    code.push_str(&format!("    ; var {} = ", name));
+                    code.push_str("    ; var ");
+                    code.push_str(name);
+                    code.push_str(" = ");
+                    self.compile_bios32_expression(code, value);
+                }
+                Statement::Assign { target, value, .. } => {
+                    code.push_str("    ; ");
+                    code.push_str(target);
+                    code.push_str(" = ");
                     self.compile_bios32_expression(code, value);
                 }
                 _ => code.push_str("    ; [Statement]\n"),
@@ -629,7 +1170,15 @@ impl NasmEmitter {
                     self.compile_bios64_expression(code, expr)?;
                 }
                 Statement::VarDecl { name, value, .. } => {
-                    code.push_str(&format!("    ; var {} = ", name));
+                    code.push_str("    ; var ");
+                    code.push_str(name);
+                    code.push_str(" = ");
+                    self.compile_bios64_expression(code, value)?;
+                }
+                Statement::Assign { target, value, .. } => {
+                    code.push_str("    ; ");
+                    code.push_str(target);
+                    code.push_str(" = ");
                     self.compile_bios64_expression(code, value)?;
                 }
                 _ => code.push_str("    ; [Statement]\n"),
@@ -711,8 +1260,22 @@ impl NasmEmitter {
         Ok(())
     }
     
-    fn compile_standard(&self, _program: &Program) -> Result<String, String> {
-        Ok(String::from("; Standard compilation not implemented\n"))
+    fn compile_standard(&mut self, program: &Program) -> Result<String, String> {
+        match self.target.platform {
+            TargetPlatform::Windows64 => self.compile_windows64(program),
+            TargetPlatform::Linux64 => self.compile_linux64(program),
+            _ => Err(format!("Unsupported platform for standard compilation: {:?}", self.target.platform))
+        }
+    }
+    
+    // Import handling (placeholder - needs to be implemented)
+    fn compile_with_imports(&mut self, program: &Program) -> Result<String, String> {
+        // For now, just compile without imports
+        if self.target.is_bios() {
+            self.compile_bios(program)
+        } else {
+            self.compile_standard(program)
+        }
     }
 }
 

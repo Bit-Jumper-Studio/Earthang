@@ -1,0 +1,19 @@
+# Test direct printing vs variable printing
+print("Testing print variations...")
+
+# Direct string
+print("Direct string")
+
+# Direct number
+print(100)
+
+# Direct expression
+print(50 + 25)
+
+# Variable then direct
+value = 999
+print(value)
+print("The value is: ")
+print(value)
+
+print("Print variations test completed!")
