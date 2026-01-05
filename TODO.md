@@ -4,13 +4,13 @@ NASM Emitter [X]
 Binary Generation [X]
 
 # 2. Executable binary generation
-Windows []
+Windows [X]
 macOS [] **Future I need to configure a build pipeline with actions.**
-Linux []
+Linux [X]
 
 # 2. RPD, Rython Package Distributions
 
-**RLC** Rython library code []
+**RCL** Rython Compiled libary [X]
 Implementation codes []
 Decentralized Repositories with Central Curation **(DRCC)** []
 **DRCC** Antivirus []

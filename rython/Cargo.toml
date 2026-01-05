@@ -2,9 +2,9 @@
 name = "rython"
 version = "0.0.1"
 description = ""
-authors = ["Emanuel"]
+authors = ["BIt Jumper Studio"]
 license = "MIT"
-repository = "https://github.com//rython"
+repository = "https://github.com/Bit-Jumper-Studio/Rython"
 readme = "README.md"
 keywords = ["compiler", "bootloader", "assembly", "bios", "uefi", "low-level"]
 categories = ["command-line-utilities", "development-tools", "systems-programming"]

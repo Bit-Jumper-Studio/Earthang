@@ -1,1 +1,0 @@
-../target/debug/rython compile test.ry --target windows64

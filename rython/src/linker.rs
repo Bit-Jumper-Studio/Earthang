@@ -10,8 +10,6 @@ pub fn manual_link(object_file: &str, output_name: &str) -> Result<(), String> {
     let object_path = Path::new(object_file).to_path_buf();
     let output_path = Path::new(output_name).to_path_buf();
     
-    // Handle the common case where object file and output have same name but different extensions
-    // If they're the same path, automatically add .exe to output for Windows
     if object_path == output_path {
         println!("Note: Object file and output have same name, adjusting output name...");
         
