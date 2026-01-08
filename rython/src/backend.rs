@@ -2,8 +2,6 @@ use crate::parser::{Program, Statement, Expr, Position, Span, Op, CompareOp};
 use std::collections::HashMap;
 use std::cell::RefCell;
 
-// ========== CORE TYPE DEFINITIONS ==========
-
 // Target platforms
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum Target {
@@ -54,7 +52,6 @@ pub enum Capability {
     _ReadOnly,
 }
 
-// Simple module representation without IR
 #[derive(Debug, Clone)]
 pub struct BackendModule {
     #[allow(dead_code)]
@@ -194,8 +191,6 @@ pub trait Backend {
     }
 }
 
-// ========== BACKEND REGISTRY ==========
-
 pub struct BackendRegistry {
     pub backends: Vec<Box<dyn Backend>>,
 }
@@ -241,7 +236,6 @@ impl BackendRegistry {
     }
 }
 
-// ========== BIOS 16-BIT BACKEND ==========
 
 pub struct Bios16Backend {
     string_literals: HashMap<String, String>,
@@ -413,7 +407,6 @@ impl Backend for Bios16Backend {
     }
 }
 
-// ========== BIOS 32-BIT BACKEND ==========
 
 pub struct Bios32Backend {
     string_literals: HashMap<String, String>,
@@ -625,7 +618,6 @@ impl Backend for Bios32Backend {
     }
 }
 
-// ========== BIOS 64-BIT BACKEND ==========
 
 pub struct Bios64Backend {
     use_sse: bool,
@@ -1182,8 +1174,6 @@ impl Backend for Bios64Backend {
         Ok(code)
     }
 }
-
-// ========== LINUX 64-BIT BACKEND ==========
 
 pub struct Linux64Backend {
     string_counter: RefCell<u32>,
@@ -1881,7 +1871,6 @@ impl Backend for Linux64Backend {
     }
 }
 
-// ========== WINDOWS 64-BIT BACKEND ==========
 
 pub struct Windows64Backend {
     string_counter: RefCell<u32>,
@@ -2223,8 +2212,6 @@ impl Backend for Windows64Backend {
                 code.push_str(&format!("    ; Variable: {}\n", name));
                 code.push_str(&format!("    mov rax, [rbp - {}]\n", offset));
                 
-                // For variables, we need to determine if they're strings or numbers
-                // For now, assume they're numbers and use the int_to_string helper
                 code.push_str("    call int_to_string    ; Convert integer to string\n");
                 code.push_str("    mov rdx, rax          ; Second arg: string address\n");
                 code.push_str("    lea rcx, [printf_format_string] ; First arg: format string\n");
@@ -2262,14 +2249,11 @@ impl Backend for Windows64Backend {
                             code.push_str(&compiled);
                         }
                         Expr::Var(_, _) => {
-                            // For variables, we need to check their type
-                            // For now, compile and let the variable handling code deal with it
                             let compiled = self.compile_expression(arg)?;
                             code.push_str(&compiled);
                         }
                         Expr::BinOp { .. } => {
                             // Handle binary operations by compiling the whole expression
-                            // This will recursively compile the operation
                             let compiled = self.compile_expression(arg)?;
                             code.push_str(&compiled);
                             

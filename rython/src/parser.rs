@@ -1,7 +1,6 @@
 use std::collections::HashMap;
 use serde::{Serialize, Deserialize};
 
-// ==================== POSITION TRACKING ====================
 
 #[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
 pub struct Position {
@@ -66,7 +65,6 @@ impl std::fmt::Display for Span {
     }
 }
 
-// ==================== ERROR HANDLING ====================
 
 #[derive(Debug, Clone)]
 pub enum ParseError {
@@ -224,7 +222,6 @@ impl std::fmt::Display for ParseError {
 
 impl std::error::Error for ParseError {}
 
-// ==================== AST DEFINITIONS ====================
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub enum Op {
@@ -318,7 +315,6 @@ pub struct Program {
     pub span: Span,
 }
 
-// ==================== TOKENS WITH POSITION ====================
 
 #[derive(Debug, Clone, PartialEq)]
 pub struct Token {
@@ -845,8 +841,6 @@ pub fn lex(input: &str) -> Result<Vec<Token>, ParseError> {
     
     Ok(tokens)
 }
-
-// ==================== PARSER WITH ERROR RECOVERY ====================
 
 pub struct Parser<'a> {
     tokens: &'a [Token],
@@ -1536,7 +1530,6 @@ pub fn parse_program(code: &str) -> Result<Program, Vec<ParseError>> {
     parser.parse_program()
 }
 
-// ==================== ERROR FORMATTING HELPERS ====================
 
 pub fn format_parse_errors(errors: &[ParseError], source: &str) -> String {
     use colored::*;
@@ -1560,13 +1553,12 @@ pub fn format_parse_errors(errors: &[ParseError], source: &str) -> String {
     output
 }
 
-// ==================== COMMON ERROR PATTERNS ====================
 
-pub fn create_missing_semicolon_error(span: Span) -> ParseError {
+pub fn create_semicolon_error(span: Span) -> ParseError {
     ParseError::syntax_error(
-        "Missing ';' at end of statement",
+        "You forgot semicolon here",
         span
-    ).with_help("Try adding ';' here")
+    ).with_help("Try adding semicolon here")
 }
 
 pub fn create_undefined_variable_error(name: &str, span: Span) -> ParseError {
