@@ -1,5 +1,0 @@
-# Versão ultra-minimalista (só ASCII básico)
-def main():
-    print("RYTHON")
-    print("1 BOOT")
-    print("2 EXIT")
