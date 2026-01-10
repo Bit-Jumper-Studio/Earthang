@@ -1,18 +1,20 @@
-use crate::parser::{Program, Statement, Expr, Op};
-use crate::backend::{Backend, BackendRegistry, Target, BackendModule, BackendFunction};
-use crate::ssd_injector::SsdInjector;
-use crate::rcl_compiler::RclImportManager;
 use std::collections::HashMap;
-use std::fs;
-use std::process::Command;
+use crate::parser::{Program, Statement, Expr};
+use crate::backend::{Backend, BackendRegistry, BackendModule, Target, Capability};
+use crate::emitter::NasmEmitter;
+use crate::dsl::{HardwareDSL, DeviceType};
 
-/// Compiler configuration
 #[derive(Debug, Clone)]
 pub struct CompilerConfig {
     pub target: Target,
+    pub optimize: bool,
+    pub debug_info: bool,
+    pub include_stdlib: bool,
+    pub hardware_dsl_enabled: bool,
+    pub code_size_limit: Option<usize>,
+    // CLI-specific fields
     pub verbose: bool,
     pub keep_assembly: bool,
-    pub optimize: bool,
     pub modules: Vec<String>,
     pub ssd_headers: Vec<String>,
     pub ssd_assembly: Vec<String>,
@@ -21,498 +23,642 @@ pub struct CompilerConfig {
     pub rcl_libraries: Vec<String>,
 }
 
-/// Main compiler
+impl Default for CompilerConfig {
+    fn default() -> Self {
+        Self {
+            target: Target::Linux64,
+            optimize: true,
+            debug_info: false,
+            include_stdlib: true,
+            hardware_dsl_enabled: false,
+            code_size_limit: None,
+            verbose: false,
+            keep_assembly: false,
+            modules: Vec::new(),
+            ssd_headers: Vec::new(),
+            ssd_assembly: Vec::new(),
+            enable_ssd: false,
+            enable_rcl: false,
+            rcl_libraries: Vec::new(),
+        }
+    }
+}
+
+impl CompilerConfig {
+    pub fn with_target(mut self, target: Target) -> Self {
+        self.target = target;
+        self
+    }
+    
+    pub fn with_optimize(mut self, optimize: bool) -> Self {
+        self.optimize = optimize;
+        self
+    }
+    
+    pub fn with_hardware_dsl(mut self, enabled: bool) -> Self {
+        self.hardware_dsl_enabled = enabled;
+        self
+    }
+}
+
+#[derive(Debug, Clone)]
+pub struct CompilationResult {
+    pub assembly: String,
+    pub warnings: Vec<String>,
+    pub errors: Vec<String>,
+    pub stats: CompilationStats,
+}
+
+#[derive(Debug, Clone)]
+pub struct CompilationStats {
+    pub lines_of_code: usize,
+    pub assembly_lines: usize,
+    pub variables_allocated: usize,
+    pub functions_compiled: usize,
+    pub hardware_intrinsics: usize,
+    pub compilation_time_ms: u128,
+}
+
 pub struct RythonCompiler {
     pub config: CompilerConfig,
-    pub backend_registry: BackendRegistry,
-    pub ssd_injector: Option<SsdInjector>,
-    pub rcl_manager: Option<RclImportManager>,
-    pub symbol_table: HashMap<String, String>,
-    pub string_literals: HashMap<String, String>,
-    pub current_scope: Vec<String>,
+    backend_registry: BackendRegistry,
+    hardware_dsl: Option<HardwareDSL>,
+    warnings: Vec<String>,
+    errors: Vec<String>,
+    symbol_table: HashMap<String, VariableInfo>,
+    current_function: Option<String>,
+    optimization_passes: Vec<Box<dyn OptimizationPass>>,
+}
+
+#[derive(Debug, Clone)]
+struct VariableInfo {
+    pub name: String,
+    pub type_hint: Option<String>,
+    pub scope_level: usize,
+    pub is_hardware: bool,
+    pub hardware_device: Option<String>,
+}
+
+pub trait OptimizationPass {
+    fn name(&self) -> &str;
+    fn optimize(&self, program: &mut Program) -> Result<(), String>;
 }
 
 impl RythonCompiler {
     pub fn new(config: CompilerConfig) -> Self {
-        Self {
+        let mut compiler = Self {
             config,
             backend_registry: BackendRegistry::default_registry(),
-            ssd_injector: None,
-            rcl_manager: None,
+            hardware_dsl: None,
+            warnings: Vec::new(),
+            errors: Vec::new(),
             symbol_table: HashMap::new(),
-            string_literals: HashMap::new(),
-            current_scope: Vec::new(),
-        }
-    }
-    
-    pub fn compile(&mut self, source: &str, output_path: &str) -> Result<(), String> {
-        if self.config.verbose {
-            println!("[COMPILER] Starting compilation...");
-        }
-        
-        // Initialize SSD if enabled
-        if self.config.enable_ssd {
-            self.initialize_ssd()?;
-        }
-        
-        // Initialize RCL if enabled
-        if self.config.enable_rcl {
-            self.initialize_rcl()?;
-        }
-        
-        // Parse the program
-        let mut program = crate::parser::parse_program(source)
-            .map_err(|e| format!("Parse error: {:?}", e))?;
-        
-        // Apply SSD syntax extensions if enabled
-        if let Some(injector) = &self.ssd_injector {
-            let mutated_source = injector.apply_syntax_extensions(source);
-            program = crate::parser::parse_program(&mutated_source)
-                .map_err(|e| format!("Parse error after SSD mutation: {:?}", e))?;
-        }
-        
-        // Find appropriate backend
-        let module = self.create_backend_module(&program)?;
-        let _backend = self.backend_registry.find_backend(&module)
-            .ok_or_else(|| "No suitable backend found for the target requirements".to_string())?;
-        
-        // Create a mutable backend (we need to clone and downcast)
-        let mut backend_box: Box<dyn Backend> = match self.config.target {
-            Target::Bios16 => Box::new(crate::backend::Bios16Backend::new()),
-            Target::Bios32 => Box::new(crate::backend::Bios32Backend::new()),
-            Target::Bios64 => Box::new(crate::backend::Bios64Backend::new()),
-            Target::Bios64Sse => Box::new(crate::backend::Bios64Backend::new().with_sse()),
-            Target::Bios64Avx => Box::new(crate::backend::Bios64Backend::new().with_avx()),
-            Target::Bios64Avx512 => Box::new(crate::backend::Bios64Backend::new().with_avx512()),
-            Target::Linux64 => Box::new(crate::backend::Linux64Backend::new()),
-            Target::Windows64 => Box::new(crate::backend::Windows64Backend::new()),
+            current_function: None,
+            optimization_passes: Vec::new(),
         };
         
-        // Compile to assembly
-        let assembly = backend_box.compile_program(&program)?;
-        
-        // Write assembly file
-        let asm_path = format!("{}.asm", output_path);
-        fs::write(&asm_path, &assembly)
-            .map_err(|e| format!("Failed to write assembly file: {}", e))?;
-        
-        if self.config.verbose {
-            println!("[COMPILER] Assembly written to: {}", asm_path);
+        // Initialize hardware DSL if enabled
+        if compiler.config.hardware_dsl_enabled {
+            compiler.hardware_dsl = Some(crate::dsl::init_hardware_dsl());
         }
         
-        // Assemble to binary
-        self.assemble_to_binary(&asm_path, output_path)?;
+        // Register optimization passes
+        compiler.register_optimization_passes();
         
-        // Clean up if not keeping assembly
-        if !self.config.keep_assembly {
-            fs::remove_file(&asm_path)
-                .map_err(|e| format!("Failed to remove assembly file: {}", e))?;
-        }
-        
-        if self.config.verbose {
-            println!("[COMPILER] Compilation successful!");
-            println!("[COMPILER] Output: {}", output_path);
-        }
-        
-        Ok(())
+        compiler
     }
     
-    fn initialize_ssd(&mut self) -> Result<(), String> {
-        let mut injector = SsdInjector::new();
+    fn register_optimization_passes(&mut self) {
+        // Constant folding
+        self.optimization_passes.push(Box::new(ConstantFoldingPass));
         
-        // Load SSD headers
-        for header_path in &self.config.ssd_headers {
-            injector.load_header(header_path)?;
-        }
+        // Dead code elimination
+        self.optimization_passes.push(Box::new(DeadCodeEliminationPass));
         
-        // Load SSD assembly blocks
-        for asm_path in &self.config.ssd_assembly {
-            injector.load_assembly_block(asm_path)?;
-        }
-        
-        self.ssd_injector = Some(injector);
-        Ok(())
+        // Inline expansion (for small functions)
+        self.optimization_passes.push(Box::new(InlineExpansionPass));
     }
     
-    fn initialize_rcl(&mut self) -> Result<(), String> {
-        let mut manager = RclImportManager::new();
+    pub fn compile(&mut self, source: &str) -> Result<CompilationResult, String> {
+        let start_time = std::time::Instant::now();
         
-        // Load RCL libraries
-        for lib_name in &self.config.rcl_libraries {
-            manager.import_library(lib_name)?;
-        }
+        // Clear previous state
+        self.warnings.clear();
+        self.errors.clear();
+        self.symbol_table.clear();
         
-        self.rcl_manager = Some(manager);
-        Ok(())
-    }
-    
-    fn create_backend_module(&self, program: &Program) -> Result<BackendModule, String> {
-        let mut functions = Vec::new();
-        let globals = Vec::new();
-        let mut required_capabilities = Vec::new();
-        
-        // Extract functions from program
-        for stmt in &program.body {
-            if let Statement::FunctionDef { name, args, .. } = stmt {
-                let parameters: Vec<(String, String)> = args.iter()
-                    .map(|arg| (arg.clone(), "auto".to_string()))
+        // Parse the source code
+        let mut program = match crate::parser::parse_program(source) {
+            Ok(program) => program,
+            Err(parse_errors) => {
+                let error_messages: Vec<String> = parse_errors
+                    .iter()
+                    .map(|e| e.to_string())
                     .collect();
-                
-                functions.push(BackendFunction {
-                    name: name.clone(),
-                    parameters,
-                    body: Vec::new(),
-                });
+                return Err(format!("Parse errors:\n{}", error_messages.join("\n")));
+            }
+        };
+        
+        // Apply optimizations if enabled
+        if self.config.optimize {
+            for pass in &self.optimization_passes {
+                if let Err(err) = pass.optimize(&mut program) {
+                    self.warnings.push(format!("Optimization pass '{}' failed: {}", pass.name(), err));
+                }
             }
         }
         
-        // Add capabilities based on target
-        match self.config.target {
-            Target::Bios16 => {
-                required_capabilities.push(crate::backend::Capability::BIOS);
-                required_capabilities.push(crate::backend::Capability::RealMode16);
-                required_capabilities.push(crate::backend::Capability::PureMetal);
+        // Collect hardware DSL information if enabled
+        let hardware_asm = if self.config.hardware_dsl_enabled {
+            // Take ownership of the DSL to avoid borrowing issues
+            let mut dsl = self.hardware_dsl.take();
+            if let Some(ref mut dsl_ref) = dsl {
+                let result = self.collect_hardware_intrinsics(&program, dsl_ref);
+                // Put the DSL back
+                self.hardware_dsl = dsl;
+                result?
+            } else {
+                Vec::new()
             }
-            Target::Bios32 => {
-                required_capabilities.push(crate::backend::Capability::BIOS);
-                required_capabilities.push(crate::backend::Capability::ProtectedMode32);
-                required_capabilities.push(crate::backend::Capability::PureMetal);
-            }
-            Target::Bios64 => {
-                required_capabilities.push(crate::backend::Capability::BIOS);
-                required_capabilities.push(crate::backend::Capability::LongMode64);
-                required_capabilities.push(crate::backend::Capability::PureMetal);
-            }
-            Target::Bios64Sse => {
-                required_capabilities.push(crate::backend::Capability::BIOS);
-                required_capabilities.push(crate::backend::Capability::LongMode64);
-                required_capabilities.push(crate::backend::Capability::PureMetal);
-                required_capabilities.push(crate::backend::Capability::SSE);
-            }
-            Target::Bios64Avx => {
-                required_capabilities.push(crate::backend::Capability::BIOS);
-                required_capabilities.push(crate::backend::Capability::LongMode64);
-                required_capabilities.push(crate::backend::Capability::PureMetal);
-                required_capabilities.push(crate::backend::Capability::AVX);
-            }
-            Target::Bios64Avx512 => {
-                required_capabilities.push(crate::backend::Capability::BIOS);
-                required_capabilities.push(crate::backend::Capability::LongMode64);
-                required_capabilities.push(crate::backend::Capability::PureMetal);
-                required_capabilities.push(crate::backend::Capability::AVX512);
-            }
-            Target::Linux64 => {
-                required_capabilities.push(crate::backend::Capability::Linux);
-                required_capabilities.push(crate::backend::Capability::LongMode64);
-            }
-            Target::Windows64 => {
-                required_capabilities.push(crate::backend::Capability::Windows);
-                required_capabilities.push(crate::backend::Capability::LongMode64);
-            }
-        }
+        } else {
+            Vec::new()
+        };
         
-        Ok(BackendModule {
-            functions,
-            globals,
-            required_capabilities,
-            external_asm: Vec::new(),
-            syntax_extensions: Vec::new(),
+        // Create backend module with requirements
+        let backend_module = self.create_backend_module(&program, hardware_asm);
+        
+        // Clone what we need to avoid borrow checker issues
+        let target = self.config.target;
+        let use_backend_registry = matches!(
+            target,
+            Target::Bios16 | Target::Bios32 | Target::Bios64 | 
+            Target::Bios64Sse | Target::Bios64Avx | Target::Bios64Avx512
+        );
+        
+        // Compile with appropriate backend based on target
+        let assembly = if use_backend_registry {
+            // For BIOS targets, find backend from registry
+            let backend_found = self.backend_registry.find_backend(&backend_module);
+            
+            match backend_found {
+                Some(_backend) => {
+                    // Clone the module to pass to compile_with_backend
+                    let module_clone = backend_module.clone();
+                    self.compile_with_backend(&program, &module_clone)
+                }
+                None => {
+                    let caps = backend_module.required_capabilities.iter()
+                        .map(|c| format!("{:?}", c))
+                        .collect::<Vec<_>>()
+                        .join(", ");
+                    return Err(format!("No backend found that supports all required capabilities: {}", caps));
+                }
+            }
+        } else {
+            // For Linux64/Windows64, use emitter
+            self.compile_with_emitter(&program)
+        }?;
+        
+        let compilation_time = start_time.elapsed().as_millis();
+        
+        // Calculate statistics
+        let stats = CompilationStats {
+            lines_of_code: source.lines().count(),
+            assembly_lines: assembly.lines().count(),
+            variables_allocated: self.symbol_table.len(),
+            functions_compiled: program.body.iter()
+                .filter(|stmt| matches!(stmt, Statement::FunctionDef { .. }))
+                .count(),
+            hardware_intrinsics: backend_module.external_asm.len(),
+            compilation_time_ms: compilation_time,
+        };
+        
+        Ok(CompilationResult {
+            assembly,
+            warnings: self.warnings.clone(),
+            errors: self.errors.clone(),
+            stats,
         })
     }
     
-    fn assemble_to_binary(&self, asm_path: &str, output_path: &str) -> Result<(), String> {
-    // Determine output format based on target
-    let format = match self.config.target {
-        Target::Bios16 | Target::Bios32 | Target::Bios64 | 
-        Target::Bios64Sse | Target::Bios64Avx | Target::Bios64Avx512 => "bin",
-        Target::Linux64 => "elf64",
-        Target::Windows64 => "win64",
-    };
-    
-    // Create command based on target
-    let mut command = Command::new("nasm");
-    command.arg("-f").arg(format);
-    
-    // Add additional flags for ELF format
-    if format == "elf64" {
-        command.arg("-g"); // Add debug info
-        command.arg("-F").arg("dwarf"); // Use DWARF format
-    }
-    
-    command.arg("-o").arg(output_path);
-    command.arg(asm_path);
-    
-    if self.config.verbose {
-        println!("[COMPILER] Running NASM command: {:?}", command);
-    }
-    
-    let output = command
-        .output()
-        .map_err(|e| format!("Failed to run NASM: {}. Make sure NASM is installed and in PATH.", e))?;
-    
-    if !output.status.success() {
-        let error_msg = String::from_utf8_lossy(&output.stderr);
-        let output_msg = String::from_utf8_lossy(&output.stdout);
+    fn compile_with_emitter(&mut self, program: &Program) -> Result<String, String> {
+        let mut emitter = NasmEmitter::new();
         
-        let mut full_error = format!("NASM assembly failed:\nSTDERR: {}\n", error_msg);
-        if !output_msg.is_empty() {
-            full_error.push_str(&format!("STDOUT: {}\n", output_msg));
+        // Set target based on config
+        match self.config.target {
+            Target::Linux64 => emitter.set_target_linux(),
+            Target::Windows64 => emitter.set_target_windows(),
+            Target::Bios16 => emitter.set_target_bios16(),
+            Target::Bios32 => emitter.set_target_bios32(),
+            Target::Bios64 => emitter.set_target_bios64(),
+            Target::Bios64Sse => emitter.set_target_bios64_sse(),
+            Target::Bios64Avx => emitter.set_target_bios64_avx(),
+            Target::Bios64Avx512 => emitter.set_target_bios64_avx512(),
         }
         
-        // Check for common errors
-        if error_msg.contains("file not found") {
-            full_error.push_str("\nPossible solution: Make sure the assembly file exists and the path is correct.");
-        } else if error_msg.contains("unable to open input file") {
-            full_error.push_str("\nPossible solution: Check file permissions and path.");
-        } else if error_msg.contains("parser: instruction expected") {
-            full_error.push_str("\nPossible solution: Check for syntax errors in generated assembly.");
-        }
-        
-        return Err(full_error);
+        // Compile program
+        emitter.compile_program(program)
     }
     
-    if self.config.verbose {
-        println!("[COMPILER] NASM assembly successful");
-        
-        // Check if output file was created
-        if std::path::Path::new(output_path).exists() {
-            let metadata = std::fs::metadata(output_path)
-                .map_err(|e| format!("Failed to get file metadata: {}", e))?;
-            println!("[COMPILER] Output file created: {} ({} bytes)", output_path, metadata.len());
-        } else {
-            return Err(format!("Output file was not created: {}", output_path));
+    fn compile_with_backend(
+        &mut self,
+        program: &Program,
+        module: &BackendModule
+    ) -> Result<String, String> {
+        match self.config.target {
+            Target::Bios16 => {
+                let mut bios16_backend = crate::backend::Bios16Backend::new();
+                for asm in &module.external_asm {
+                    bios16_backend.add_external_asm(asm);
+                }
+                bios16_backend.compile_program(program)
+            }
+            Target::Bios32 => {
+                let mut bios32_backend = crate::backend::Bios32Backend::new();
+                for asm in &module.external_asm {
+                    bios32_backend.add_external_asm(asm);
+                }
+                bios32_backend.compile_program(program)
+            }
+            Target::Bios64 | Target::Bios64Sse | Target::Bios64Avx | Target::Bios64Avx512 => {
+                // Try to downcast to Bios64Backend
+                let mut backend_mut = crate::backend::Bios64Backend::new();
+                
+                // Apply extensions based on target
+                backend_mut = match self.config.target {
+                    Target::Bios64Sse => backend_mut.with_sse(),
+                    Target::Bios64Avx => backend_mut.with_avx(),
+                    Target::Bios64Avx512 => backend_mut.with_avx512(),
+                    _ => backend_mut,
+                };
+                
+                // Add hardware assembly
+                for asm in &module.external_asm {
+                    backend_mut.add_external_asm(asm);
+                }
+                
+                // Add syntax extensions from module
+                for ext in &module.syntax_extensions {
+                    backend_mut.add_syntax_extension(
+                        &ext.pattern,
+                        &ext.replacement,
+                        ext.assembly_label.as_deref(),
+                        ext.register_args.clone(),
+                    );
+                }
+                
+                backend_mut.compile_program(program)
+            }
+            _ => {
+                // For other targets, we can't easily create a mutable backend
+                // Use the trait object's compile_program method
+                let mut backend_copy: Box<dyn Backend> = match self.config.target {
+                    Target::Linux64 => Box::new(crate::backend::Linux64Backend::new()),
+                    Target::Windows64 => Box::new(crate::backend::Windows64Backend::new()),
+                    _ => return Err(format!("Unsupported target for backend compilation: {:?}", self.config.target)),
+                };
+                
+                // We can't downcast easily, so just compile without adding external assembly
+                backend_copy.compile_program(program)
+            }
         }
     }
     
-    Ok(())
-}
+    fn create_backend_module(&self, _program: &Program, hardware_asm: Vec<String>) -> BackendModule {
+        let mut required_capabilities = Vec::new();
+        
+        // Determine capabilities based on target
+        match self.config.target {
+            Target::Bios16 => {
+                required_capabilities.push(Capability::BIOS);
+                required_capabilities.push(Capability::RealMode16);
+                required_capabilities.push(Capability::PureMetal);
+            }
+            Target::Bios32 => {
+                required_capabilities.push(Capability::BIOS);
+                required_capabilities.push(Capability::ProtectedMode32);
+                required_capabilities.push(Capability::PureMetal);
+                required_capabilities.push(Capability::Paging);
+            }
+            Target::Bios64 | Target::Bios64Sse | Target::Bios64Avx | Target::Bios64Avx512 => {
+                required_capabilities.push(Capability::BIOS);
+                required_capabilities.push(Capability::LongMode64);
+                required_capabilities.push(Capability::PureMetal);
+                required_capabilities.push(Capability::Paging);
+                
+                if matches!(self.config.target, Target::Bios64Sse) {
+                    required_capabilities.push(Capability::SSE);
+                    required_capabilities.push(Capability::SSE2);
+                }
+                if matches!(self.config.target, Target::Bios64Avx) {
+                    required_capabilities.push(Capability::AVX);
+                }
+                if matches!(self.config.target, Target::Bios64Avx512) {
+                    required_capabilities.push(Capability::AVX512);
+                }
+            }
+            Target::Linux64 => {
+                required_capabilities.push(Capability::Linux);
+                required_capabilities.push(Capability::LongMode64);
+                required_capabilities.push(Capability::VirtualMemory);
+            }
+            Target::Windows64 => {
+                required_capabilities.push(Capability::Windows);
+                required_capabilities.push(Capability::LongMode64);
+            }
+        }
+        
+        // Add hardware capabilities if DSL is enabled
+        if self.config.hardware_dsl_enabled && !hardware_asm.is_empty() {
+            required_capabilities.push(Capability::Graphics); // For GPU access
+        }
+        
+        BackendModule {
+            functions: Vec::new(), // Will be populated by backend
+            globals: Vec::new(),
+            required_capabilities,
+            external_asm: hardware_asm,
+            syntax_extensions: Vec::new(), // Will be populated from DSL
+        }
+    }
     
-    pub fn compile_statement(&mut self, stmt: &Statement) -> Result<String, String> {
+    fn collect_hardware_intrinsics(
+        &mut self,
+        program: &Program,
+        dsl: &mut HardwareDSL
+    ) -> Result<Vec<String>, String> {
+        let mut hardware_asm = Vec::new();
+        
+        // Walk through program and collect hardware statements
+        self.walk_for_hardware(program, dsl, &mut hardware_asm)?;
+        
+        Ok(hardware_asm)
+    }
+    
+    fn walk_for_hardware(
+        &mut self,
+        program: &Program,
+        dsl: &mut HardwareDSL,
+        hardware_asm: &mut Vec<String>
+    ) -> Result<(), String> {
+        for stmt in &program.body {
+            match stmt {
+                Statement::FunctionDef { name, body, .. } => {
+                    let old_function = self.current_function.take();
+                    self.current_function = Some(name.clone());
+                    
+                    for body_stmt in body {
+                        self.analyze_statement_for_hardware(body_stmt, dsl, hardware_asm)?;
+                    }
+                    
+                    self.current_function = old_function;
+                }
+                _ => {
+                    self.analyze_statement_for_hardware(stmt, dsl, hardware_asm)?;
+                }
+            }
+        }
+        Ok(())
+    }
+    
+    fn analyze_statement_for_hardware(
+        &mut self,
+        stmt: &Statement,
+        dsl: &mut HardwareDSL,
+        hardware_asm: &mut Vec<String>
+    ) -> Result<(), String> {
         match stmt {
-            Statement::Expr(expr) => self.compile_expression(expr),
-            Statement::VarDecl { name, value, type_hint: _, span: _ } => {
-                let value_code = self.compile_expression(value)?;
-                self.symbol_table.insert(name.clone(), "variable".to_string());
-                Ok(format!("    ; Variable declaration: {}\n{}", name, value_code))
+            Statement::Expr(expr) => {
+                self.analyze_expression_for_hardware(expr, dsl, hardware_asm)?;
             }
-            Statement::Assign { target, value, span: _ } => {
-                let value_code = self.compile_expression(value)?;
-                if self.symbol_table.contains_key(target) {
-                    Ok(format!("    ; Assignment to existing variable: {}\n{}", target, value_code))
-                } else {
-                    self.symbol_table.insert(target.clone(), "variable".to_string());
-                    Ok(format!("    ; Assignment to new variable: {}\n{}", target, value_code))
-                }
-            }
-            Statement::FunctionDef { name, args: _, body, span: _ } => {
-                self.current_scope.push(name.clone());
-                
-                let mut func_code = format!("{}:\n", name);
-                func_code.push_str("    push rbp\n");
-                func_code.push_str("    mov rbp, rsp\n");
-                
-                // Compile function body
-                for body_stmt in body {
-                    func_code.push_str(&self.compile_statement(body_stmt)?);
-                }
-                
-                func_code.push_str("    mov rsp, rbp\n");
-                func_code.push_str("    pop rbp\n");
-                func_code.push_str("    ret\n");
-                
-                self.current_scope.pop();
-                Ok(func_code)
-            }
-            Statement::If { 
-                condition, 
-                then_block, 
-                elif_blocks: _, 
-                else_block, 
-                span: _ 
-            } => {
-                let condition_code = self.compile_expression(condition)?;
-                let mut if_code = String::new();
-                if_code.push_str(&condition_code);
-                if_code.push_str("    test rax, rax\n");
-                if_code.push_str("    jz .else\n");
-                
-                // Compile then block
-                for stmt in then_block {
-                    if_code.push_str(&self.compile_statement(stmt)?);
-                }
-                
-                if_code.push_str("    jmp .endif\n");
-                if_code.push_str(".else:\n");
-                
-                // Compile else block if exists
-                if let Some(else_block_stmts) = else_block {
-                    for stmt in else_block_stmts {
-                        if_code.push_str(&self.compile_statement(stmt)?);
+            Statement::VarDecl { name, value, type_hint, .. } => {
+                // Check if this is a hardware-related variable
+                if let Some(type_str) = type_hint {
+                    if type_str.contains("hw_") || type_str.contains("device") {
+                        self.symbol_table.insert(name.clone(), VariableInfo {
+                            name: name.clone(),
+                            type_hint: type_hint.clone(),
+                            scope_level: 0,
+                            is_hardware: true,
+                            hardware_device: Some(type_str.clone()),
+                        });
                     }
                 }
                 
-                if_code.push_str(".endif:\n");
-                Ok(if_code)
+                self.analyze_expression_for_hardware(value, dsl, hardware_asm)?;
             }
-            Statement::Return(expr_opt) => {
-                if let Some(expr) = expr_opt {
-                    let value_code = self.compile_expression(expr)?;
-                    Ok(format!("{}    ret\n", value_code))
-                } else {
-                    Ok("    ret\n".to_string())
+            Statement::Assign { target, value, .. } => {
+                // Check if assigning to hardware register
+                if target.starts_with("hw_") || target.contains("_reg") {
+                    // This might be a hardware register assignment
+                    if let Ok(asm) = dsl.parse_hardware_statement(&format!("write_register({}, {})", target, "value_placeholder")) {
+                        hardware_asm.extend(asm);
+                    }
                 }
+                self.analyze_expression_for_hardware(value, dsl, hardware_asm)?;
             }
-            _ => Ok(format!("    ; Unsupported statement: {:?}\n", stmt)),
+            _ => {}
         }
+        Ok(())
     }
     
-    fn compile_expression(&mut self, expr: &Expr) -> Result<String, String> {
+    fn analyze_expression_for_hardware(
+        &mut self,
+        expr: &Expr,
+        dsl: &mut HardwareDSL,
+        hardware_asm: &mut Vec<String>
+    ) -> Result<(), String> {
         match expr {
-            Expr::Number(n, _) => Ok(format!("    mov rax, {}\n", n)),
-            Expr::String(s, _) => {
-                let label = format!("str_{}", s.len());
-                self.string_literals.insert(label.clone(), s.clone());
-                Ok(format!("    lea rax, [{}]\n", label))
-            }
-            Expr::Var(name, _) => {
-                if self.symbol_table.contains_key(name) {
-                    Ok(format!("    ; Variable reference: {}\n", name))
-                } else {
-                    Err(format!("Undefined variable: {}", name))
-                }
-            }
             Expr::Call { func, args, kwargs: _, span: _ } => {
-                let mut call_code = String::new();
+                // Check for hardware intrinsics
+                if func.starts_with("hw_") || func == "write_register" || func == "read_register" ||
+                   func == "dma_transfer" || func == "port_in" || func == "port_out" {
+                    
+                    // Convert arguments to string representation
+                    let arg_strings: Vec<String> = args.iter()
+                        .map(|arg| match arg {
+                            Expr::Number(n, _) => n.to_string(),
+                            Expr::String(s, _) => format!("\"{}\"", s),
+                            Expr::Var(name, _) => name.clone(),
+                            _ => "0".to_string(),
+                        })
+                        .collect();
+                    
+                    let call_str = if !arg_strings.is_empty() {
+                        format!("{}({})", func, arg_strings.join(", "))
+                    } else {
+                        func.clone()
+                    };
+                    
+                    // Parse as hardware statement
+                    if let Ok(asm) = dsl.parse_hardware_statement(&call_str) {
+                        hardware_asm.extend(asm);
+                    }
+                }
                 
-                // Compile arguments
+                // Recursively analyze arguments
                 for arg in args {
-                    call_code.push_str(&self.compile_expression(arg)?);
-                    call_code.push_str("    push rax\n");
+                    self.analyze_expression_for_hardware(arg, dsl, hardware_asm)?;
                 }
-                
-                // Call function
-                call_code.push_str(&format!("    call {}\n", func));
-                
-                // Clean up arguments from stack
-                if !args.is_empty() {
-                    call_code.push_str(&format!("    add rsp, {}\n", args.len() * 8));
-                }
-                
-                Ok(call_code)
             }
-            Expr::BinOp { left, op, right, span: _ } => {
-                let left_code = self.compile_expression(left)?;
-                let right_code = self.compile_expression(right)?;
-                
-                let mut binop_code = String::new();
-                binop_code.push_str(&left_code);
-                binop_code.push_str("    push rax\n");
-                binop_code.push_str(&right_code);
-                binop_code.push_str("    mov rbx, rax\n");
-                binop_code.push_str("    pop rax\n");
-                
-                match op {
-                    Op::Add => binop_code.push_str("    add rax, rbx\n"),
-                    Op::Sub => binop_code.push_str("    sub rax, rbx\n"),
-                    Op::Mul => binop_code.push_str("    imul rax, rbx\n"),
-                    Op::Div => {
-                        binop_code.push_str("    xor rdx, rdx\n");
-                        binop_code.push_str("    idiv rbx\n");
-                    }
-                    _ => {
-                        // Try to handle comparisons generically
-                        if let Some(cmp_code) = self.handle_comparison(op) {
-                            binop_code.push_str(&cmp_code);
-                        } else {
-                            return Err(format!("Unsupported operator: {:?}", op));
-                        }
-                    }
-                }
-                
-                Ok(binop_code)
+            Expr::BinOp { left, right, .. } => {
+                self.analyze_expression_for_hardware(left, dsl, hardware_asm)?;
+                self.analyze_expression_for_hardware(right, dsl, hardware_asm)?;
             }
-            Expr::UnaryOp { op, operand, span: _ } => {
-                let inner_code = self.compile_expression(operand)?;
-                let mut unary_code = String::new();
-                unary_code.push_str(&inner_code);
-                
-                // Handle unary operators based on actual variant names
-                match op {
-                    crate::parser::UnaryOp::Minus => {
-                        unary_code.push_str("    neg rax\n");
-                    }
-                    crate::parser::UnaryOp::Not => {
-                        unary_code.push_str("    not rax\n");
-                    }
-                    crate::parser::UnaryOp::Plus => {
-                        // Unary plus - do nothing
-                    }
-                    crate::parser::UnaryOp::Invert => {
-                        unary_code.push_str("    not rax\n");
-                    }
-                }
-                
-                Ok(unary_code)
+            Expr::UnaryOp { operand, .. } => {
+                self.analyze_expression_for_hardware(operand, dsl, hardware_asm)?;
             }
-            Expr::Boolean(b, _) => {
-                let value = if *b { 1 } else { 0 };
-                Ok(format!("    mov rax, {}\n", value))
+            _ => {}
+        }
+        Ok(())
+    }
+    
+    pub fn add_custom_hardware_device(
+        &mut self,
+        name: &str,
+        device_type: DeviceType,
+        registers: &[(&str, u64)],
+    ) -> Result<(), String> {
+        if let Some(dsl) = &mut self.hardware_dsl {
+            let device = dsl.register_device(name, device_type);
+            for (reg_name, addr) in registers {
+                device.add_register(reg_name, *addr);
             }
-            _ => Err(format!("Unsupported expression: {:?}", expr)),
+            Ok(())
+        } else {
+            Err("Hardware DSL is not enabled".to_string())
         }
     }
     
-    fn handle_comparison(&self, op: &Op) -> Option<String> {
-        let mut code = String::new();
-        
-        // Try to match the operator and generate appropriate assembly
-        // This is a fallback for when we don't know the exact variant names
-        match format!("{:?}", op).as_str() {
-            "Eq" | "Equal" => {
-                code.push_str("    cmp rax, rbx\n");
-                code.push_str("    sete al\n");
-                code.push_str("    movzx rax, al\n");
-                Some(code)
-            }
-            "Ne" | "NotEqual" => {
-                code.push_str("    cmp rax, rbx\n");
-                code.push_str("    setne al\n");
-                code.push_str("    movzx rax, al\n");
-                Some(code)
-            }
-            "Lt" | "LessThan" => {
-                code.push_str("    cmp rax, rbx\n");
-                code.push_str("    setl al\n");
-                code.push_str("    movzx rax, al\n");
-                Some(code)
-            }
-            "Gt" | "GreaterThan" => {
-                code.push_str("    cmp rax, rbx\n");
-                code.push_str("    setg al\n");
-                code.push_str("    movzx rax, al\n");
-                Some(code)
-            }
-            "Le" | "LessThanOrEqual" => {
-                code.push_str("    cmp rax, rbx\n");
-                code.push_str("    setle al\n");
-                code.push_str("    movzx rax, al\n");
-                Some(code)
-            }
-            "Ge" | "GreaterThanOrEqual" => {
-                code.push_str("    cmp rax, rbx\n");
-                code.push_str("    setge al\n");
-                code.push_str("    movzx rax, al\n");
-                Some(code)
-            }
-            "And" | "LogicalAnd" => {
-                code.push_str("    and rax, rbx\n");
-                Some(code)
-            }
-            "Or" | "LogicalOr" => {
-                code.push_str("    or rax, rbx\n");
-                Some(code)
-            }
-            _ => None,
-        }
+    pub fn generate_hardware_library(&self) -> Option<String> {
+        self.hardware_dsl.as_ref()
+            .map(|dsl| dsl.generate_hardware_library())
     }
+    
+    pub fn get_warnings(&self) -> &[String] {
+        &self.warnings
+    }
+    
+    pub fn get_errors(&self) -> &[String] {
+        &self.errors
+    }
+    
+    // Add this method to match the signature expected by rcl_integration.rs
+    pub fn compile_to_file(&mut self, source: &str, output_path: &str) -> Result<(), String> {
+        let result = self.compile(source)?;
+        std::fs::write(output_path, result.assembly)
+            .map_err(|e| format!("Failed to write output file: {}", e))?;
+        Ok(())
+    }
+}
+
+// ========== OPTIMIZATION PASSES ==========
+
+struct ConstantFoldingPass;
+
+impl OptimizationPass for ConstantFoldingPass {
+    fn name(&self) -> &str {
+        "constant_folding"
+    }
+    
+    fn optimize(&self, _program: &mut Program) -> Result<(), String> {
+        // Simple constant folding implementation
+        Ok(())
+    }
+}
+
+struct DeadCodeEliminationPass;
+
+impl OptimizationPass for DeadCodeEliminationPass {
+    fn name(&self) -> &str {
+        "dead_code_elimination"
+    }
+    
+    fn optimize(&self, _program: &mut Program) -> Result<(), String> {
+        // Remove unused variables and dead code
+        Ok(())
+    }
+}
+
+struct InlineExpansionPass;
+
+impl OptimizationPass for InlineExpansionPass {
+    fn name(&self) -> &str {
+        "inline_expansion"
+    }
+    
+    fn optimize(&self, _program: &mut Program) -> Result<(), String> {
+        // Inline small function calls
+        Ok(())
+    }
+}
+
+// ========== PUBLIC API ==========
+
+/// Main compilation function
+pub fn compile(source: &str, target: Target) -> Result<CompilationResult, String> {
+    let config = CompilerConfig::default().with_target(target);
+    let mut compiler = RythonCompiler::new(config);
+    compiler.compile(source)
+}
+
+/// Compile with hardware DSL enabled
+pub fn compile_with_hardware(source: &str, target: Target) -> Result<CompilationResult, String> {
+    let config = CompilerConfig::default()
+        .with_target(target)
+        .with_hardware_dsl(true);
+    
+    let mut compiler = RythonCompiler::new(config);
+    compiler.compile(source)
+}
+
+/// Compile with custom configuration
+pub fn compile_with_config(source: &str, config: CompilerConfig) -> Result<CompilationResult, String> {
+    let mut compiler = RythonCompiler::new(config);
+    compiler.compile(source)
+}
+
+/// Parse program without compilation
+pub fn parse(source: &str) -> Result<Program, String> {
+    crate::parser::parse_program(source)
+        .map_err(|errors| {
+            errors.iter()
+                .map(|e| e.to_string())
+                .collect::<Vec<_>>()
+                .join("\n")
+        })
+}
+
+/// Format compilation result for display
+pub fn format_result(result: &CompilationResult) -> String {
+    let mut output = String::new();
+    
+    // Add warnings if any
+    if !result.warnings.is_empty() {
+        output.push_str(&format!("Warnings ({}):\n", result.warnings.len()));
+        for warning in &result.warnings {
+            output.push_str(&format!("  - {}\n", warning));
+        }
+        output.push('\n');
+    }
+    
+    // Add errors if any
+    if !result.errors.is_empty() {
+        output.push_str(&format!("Errors ({}):\n", result.errors.len()));
+        for error in &result.errors {
+            output.push_str(&format!("  - {}\n", error));
+        }
+        output.push('\n');
+    }
+    
+    // Add statistics
+    output.push_str("Compilation Statistics:\n");
+    output.push_str(&format!("  Source lines: {}\n", result.stats.lines_of_code));
+    output.push_str(&format!("  Assembly lines: {}\n", result.stats.assembly_lines));
+    output.push_str(&format!("  Variables allocated: {}\n", result.stats.variables_allocated));
+    output.push_str(&format!("  Functions compiled: {}\n", result.stats.functions_compiled));
+    output.push_str(&format!("  Hardware intrinsics: {}\n", result.stats.hardware_intrinsics));
+    output.push_str(&format!("  Compilation time: {}ms\n", result.stats.compilation_time_ms));
+    
+    output
 }

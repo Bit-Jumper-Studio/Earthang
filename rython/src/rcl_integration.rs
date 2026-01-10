@@ -1,6 +1,6 @@
 use std::path::Path;
 use crate::parser::parse_program;
-use crate::compiler::{RythonCompiler, CompilerConfig};
+use crate::compiler::{RythonCompiler, CompilerConfig, CompilationResult};
 use crate::rcl_compiler::{RclCompiler, RclAssemblyGenerator};
 
 // Update the import
@@ -31,7 +31,9 @@ impl RythonCompilerWithRcl {
         
         let mut base_compiler = RythonCompiler::new(self.base_config.clone());
         base_compiler.config.enable_rcl = true;
-        base_compiler.compile(source, output_path)?;
+        
+        // Use the new compile_to_file method
+        base_compiler.compile_to_file(source, output_path)?;
 
         if self.base_config.verbose {
             println!("[RCL] Compilation successful!");
@@ -53,10 +55,14 @@ pub fn compile_with_rcl(source: &str, output_path: &str, target: Target) -> Resu
         enable_ssd: false,
         enable_rcl: true,
         rcl_libraries: Vec::new(),
+        debug_info: false,
+        include_stdlib: false,
+        hardware_dsl_enabled: false,
+        code_size_limit: None,
     };
     
     let mut compiler = RythonCompiler::new(config);
-    compiler.compile(source, output_path)
+    compiler.compile_to_file(source, output_path)
 }
 
 pub fn create_rcl_library(source: &str, output_file: &str, target: &str) -> Result<(), String> {
@@ -216,4 +222,4 @@ impl RclCli {
         println!("Created test library with real functions: {}", output_file);
         Ok(())
     }
-}   
+}

@@ -286,10 +286,18 @@ impl Cli {
             enable_ssd: args.ssd || args.test_ssd,
             enable_rcl: args.rcl,
             rcl_libraries: args.rcl_lib.clone(),
+            debug_info: false,
+            include_stdlib: false,
+            hardware_dsl_enabled: false,
+            code_size_limit: None,
         };
         
         let mut compiler = RythonCompiler::new(config);
-        compiler.compile(&source, &output_file.to_string_lossy())?;
+        let result = compiler.compile(&source)?;
+        
+        // Write the assembly to file
+        std::fs::write(&output_file, result.assembly)
+            .map_err(|e| format!("Failed to write output file '{}': {}", output_file.display(), e))?;
         
         if verbose {
             println!("[COMPILER] Compilation successful!");

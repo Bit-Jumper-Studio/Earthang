@@ -16,6 +16,8 @@ __pycache__
 
 tests
 
-test/bin
-test/lib 
-test/include
+rython/test/bin
+rython/test/lib 
+rython/test/include
+
+rython/test/rython

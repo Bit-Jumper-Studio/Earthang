@@ -1,6 +1,8 @@
-use crate::parser::{Program, Statement, Expr, Position, Span, Op, CompareOp};
+use crate::parser::{Program, Statement, Expr, Position, Span, Op};
+use crate::dsl::{HardwareDSL};
 use std::collections::HashMap;
 use std::cell::RefCell;
+use std::any::Any;
 
 // Target platforms
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -141,7 +143,7 @@ pub trait Backend {
     fn function_epilogue(&self, func: &BackendFunction) -> String;
     
     /// Generate instruction from expression
-    fn compile_expression(&self, expr: &Expr) -> Result<String, String>;
+    fn compile_expression(&mut self, expr: &Expr) -> Result<String, String>;
     
     /// SSD: Inject external assembly into generated code
     fn inject_external_asm(&self, base_asm: &str, external_asm: &[String]) -> String {
@@ -189,6 +191,10 @@ pub trait Backend {
         
         asm
     }
+    
+    /// For downcasting
+    fn as_any(&self) -> &dyn Any;
+    fn as_any_mut(&mut self) -> &mut dyn Any;
 }
 
 pub struct BackendRegistry {
@@ -386,7 +392,7 @@ impl Backend for Bios16Backend {
         "    mov sp, bp\n    pop bp\n    ret\n".to_string()
     }
     
-    fn compile_expression(&self, expr: &Expr) -> Result<String, String> {
+    fn compile_expression(&mut self, expr: &Expr) -> Result<String, String> {
         match expr {
             Expr::Number(n, _) => Ok(format!("    ; Number: {}\n    mov ax, {}\n    call print_decimal\n", n, n)),
             Expr::String(s, _) => Ok(format!("    ; String: '{}'\n    mov si, str_const\n    call print_string\n", s)),
@@ -404,6 +410,14 @@ impl Backend for Bios16Backend {
             }
             _ => Ok("    ; [Expression]\n".to_string()),
         }
+    }
+    
+    fn as_any(&self) -> &dyn Any {
+        self
+    }
+    
+    fn as_any_mut(&mut self) -> &mut dyn Any {
+        self
     }
 }
 
@@ -595,7 +609,7 @@ impl Backend for Bios32Backend {
         "    mov esp, ebp\n    pop ebp\n    ret\n".to_string()
     }
     
-    fn compile_expression(&self, expr: &Expr) -> Result<String, String> {
+    fn compile_expression(&mut self, expr: &Expr) -> Result<String, String> {
         match expr {
             Expr::Number(n, _) => Ok(format!("    mov eax, {}\n    call print_decimal_32\n", n)),
             Expr::String(s, _) => {
@@ -616,6 +630,14 @@ impl Backend for Bios32Backend {
             _ => Ok("    ; [Expression]\n".to_string()),
         }
     }
+    
+    fn as_any(&self) -> &dyn Any {
+        self
+    }
+    
+    fn as_any_mut(&mut self) -> &mut dyn Any {
+        self
+    }
 }
 
 
@@ -629,6 +651,7 @@ pub struct Bios64Backend {
     code_size_limit: usize,
     external_asm: Vec<String>, // SSD: Store external assembly
     syntax_extensions: Vec<SyntaxExtension>, // SSD: Syntax extensions
+    hardware_dsl: HardwareDSL, // NEW: Hardware DSL for device code generation
 }
 
 impl Bios64Backend {
@@ -642,6 +665,7 @@ impl Bios64Backend {
             code_size_limit: 4096,  // 4KB max for kernel
             external_asm: Vec::new(),
             syntax_extensions: Vec::new(),
+            hardware_dsl: HardwareDSL::new(), // NEW: Initialize hardware DSL
         }
     }
     
@@ -719,6 +743,289 @@ impl Bios64Backend {
         data
     }
     
+    // NEW: Method to compile hardware function definitions
+    fn compile_hardware_function_def(&self, device: &str, name: &str, args: &[String], body: &[Statement]) -> Result<String, String> {
+        let mut asm = String::new();
+        
+        // Generate hardware-specific prologue
+        match self.hardware_dsl.generate_device_function_prologue(device, name) {
+            Ok(prologue) => {
+                asm.push_str(&prologue);
+            }
+            Err(_) => {
+                // Fall back to generic hardware function prologue
+                asm.push_str(&format!("; Hardware function: {} for device {}\n", name, device));
+                asm.push_str(&format!("{}_hw_{}:\n", name, device));
+                asm.push_str("    push rbp\n");
+                asm.push_str("    mov rbp, rsp\n");
+                asm.push_str("    push rbx\n");
+                asm.push_str("    push rcx\n");
+                asm.push_str("    push rdx\n");
+                asm.push_str("    push rsi\n");
+                asm.push_str("    push rdi\n");
+                asm.push_str("    ; Hardware-specific setup\n");
+                asm.push_str(&format!("    ; Device: {}, Function: {}\n", device, name));
+            }
+        }
+        
+        // Handle arguments
+        if !args.is_empty() {
+            asm.push_str(&format!("    ; {} argument(s): {}\n", args.len(), args.join(", ")));
+            for (i, arg) in args.iter().enumerate() {
+                // Standard System V AMD64 calling convention for hardware functions
+                match i {
+                    0 => asm.push_str(&format!("    ; {} -> rdi\n", arg)),
+                    1 => asm.push_str(&format!("    ; {} -> rsi\n", arg)),
+                    2 => asm.push_str(&format!("    ; {} -> rdx\n", arg)),
+                    3 => asm.push_str(&format!("    ; {} -> rcx\n", arg)),
+                    4 => asm.push_str(&format!("    ; {} -> r8\n", arg)),
+                    5 => asm.push_str(&format!("    ; {} -> r9\n", arg)),
+                    _ => asm.push_str(&format!("    ; {} -> stack\n", arg)),
+                }
+            }
+        }
+        
+        // Compile the body of the hardware function
+        asm.push_str("    ; Hardware function body\n");
+        for stmt in body {
+            // For now, just add a comment - we'll implement proper compilation later
+            asm.push_str(&format!("    ; Statement: {:?}\n", stmt));
+        }
+        
+        // Generate hardware-specific epilogue
+        match self.hardware_dsl.generate_device_function_epilogue(device) {
+            Ok(epilogue) => {
+                asm.push_str(&epilogue);
+            }
+            Err(_) => {
+                // Fall back to generic hardware function epilogue
+                asm.push_str("    ; Hardware function cleanup\n");
+                asm.push_str("    pop rdi\n");
+                asm.push_str("    pop rsi\n");
+                asm.push_str("    pop rdx\n");
+                asm.push_str("    pop rcx\n");
+                asm.push_str("    pop rbx\n");
+                asm.push_str("    mov rsp, rbp\n");
+                asm.push_str("    pop rbp\n");
+                asm.push_str("    ret\n");
+            }
+        }
+        
+        Ok(asm)
+    }
+    
+    // Helper method to compile expressions without borrowing issues
+    fn compile_expression_helper(&mut self, expr: &Expr, code: &mut String) -> Result<(), String> {
+        match expr {
+            Expr::Number(n, _) => {
+                code.push_str(&format!("    ; Number: {}\n", n));
+                code.push_str(&format!("    mov rax, {}\n", n));
+                code.push_str("    call print_decimal_64\n");
+                Ok(())
+            }
+            Expr::String(s, _) => {
+                let label = self.get_string_label(s);
+                code.push_str(&format!("    ; String: '{}'\n", s));
+                code.push_str(&format!("    mov rsi, {}\n", label));
+                code.push_str("    mov rdi, 0xB8000\n");
+                code.push_str("    call print_string_64\n");
+                Ok(())
+            }
+            Expr::Var(name, _) => {
+                // BIOS64 doesn't have proper variable tracking yet
+                code.push_str(&format!("    ; Variable: {} (not implemented in BIOS64)\n", name));
+                // Return a dummy value
+                code.push_str("    mov rax, 0\n");
+                Ok(())
+            }
+            Expr::Call { func, args, kwargs: _, span: _ } => {
+                // Check if it's a hardware intrinsic
+                if func == "write_register" || func == "read_register" || 
+                   func == "dma_transfer" || func == "port_in" || func == "port_out" ||
+                   func.starts_with("hw_") {
+                    
+                    // Convert arguments to string representation for the DSL
+                    let arg_strings: Vec<String> = args.iter()
+                        .map(|arg| {
+                            match arg {
+                                Expr::Number(n, _) => n.to_string(),
+                                Expr::String(s, _) => format!("\"{}\"", s),
+                                Expr::Var(name, _) => name.clone(),
+                                _ => "0".to_string(),
+                            }
+                        })
+                        .collect();
+                    
+                    // Build the hardware statement string
+                    let stmt_str = if !arg_strings.is_empty() {
+                        format!("{}({})", func, arg_strings.join(", "))
+                    } else {
+                        func.clone()
+                    };
+                    
+                    // Use the hardware DSL to parse and generate assembly
+                    match self.hardware_dsl.parse_hardware_statement(&stmt_str) {
+                        Ok(asm_lines) => {
+                            code.push_str(&format!("    ; Hardware intrinsic: {}\n", stmt_str));
+                            for line in asm_lines {
+                                code.push_str(&format!("    {}\n", line));
+                            }
+                        }
+                        Err(_) => {
+                            // Fall back to generic hardware call
+                            code.push_str(&format!("    ; Hardware call: {}\n", func));
+                            code.push_str(&format!("    ; Generic hardware call for {}\n", func));
+                            
+                            // Handle specific hardware intrinsics
+                            if func == "write_register" && args.len() == 2 {
+                                code.push_str("    ; write_register(reg, value)\n");
+                                // Compile register address
+                                self.compile_expression_helper(&args[0], code)?;
+                                code.push_str("    push rax\n");
+                                
+                                // Compile value
+                                self.compile_expression_helper(&args[1], code)?;
+                                code.push_str("    mov rdx, rax\n");
+                                code.push_str("    pop rax\n");
+                                code.push_str("    mov rdi, rax\n");
+                                code.push_str("    ; Actually write to register (placeholder)\n");
+                                code.push_str("    ; out dx, di\n");
+                            }
+                            else if func == "read_register" && args.len() == 1 {
+                                code.push_str("    ; read_register(reg)\n");
+                                // Compile register address
+                                self.compile_expression_helper(&args[0], code)?;
+                                code.push_str("    mov rdi, rax\n");
+                                code.push_str("    ; Actually read from register (placeholder)\n");
+                                code.push_str("    ; in ax, dx\n");
+                                code.push_str("    mov rax, 0x12345678 ; Placeholder value\n");
+                            }
+                            else if func == "port_out" && args.len() == 2 {
+                                code.push_str("    ; port_out(port, value)\n");
+                                // Compile port
+                                self.compile_expression_helper(&args[0], code)?;
+                                code.push_str("    mov dx, ax\n");
+                                
+                                // Compile value
+                                self.compile_expression_helper(&args[1], code)?;
+                                code.push_str("    ; out dx, ax\n");
+                            }
+                            else if func == "port_in" && args.len() == 1 {
+                                code.push_str("    ; port_in(port)\n");
+                                // Compile port
+                                self.compile_expression_helper(&args[0], code)?;
+                                code.push_str("    mov dx, ax\n");
+                                code.push_str("    ; in ax, dx\n");
+                                code.push_str("    mov rax, 0xDEADBEEF ; Placeholder value\n");
+                            }
+                            else if func == "dma_transfer" && args.len() == 2 {
+                                code.push_str("    ; dma_transfer(address, data)\n");
+                                // Compile address
+                                self.compile_expression_helper(&args[0], code)?;
+                                code.push_str("    push rax\n");
+                                
+                                // Compile data
+                                self.compile_expression_helper(&args[1], code)?;
+                                code.push_str("    mov rsi, rax\n");
+                                code.push_str("    pop rdi\n");
+                                code.push_str("    ; Setup DMA transfer (placeholder)\n");
+                                code.push_str("    mov rcx, 512 ; Default transfer size\n");
+                                code.push_str("    rep movsb\n");
+                            }
+                            else {
+                                return Err(format!("Unsupported hardware intrinsic: {} with {} args", func, args.len()));
+                            }
+                        }
+                    }
+                }
+                else if func == "print" {
+                    if let Some(arg) = args.get(0) {
+                        // Handle each type of argument differently
+                        match arg {
+                            Expr::Number(_, _) => {
+                                // Compile the argument as a number
+                                self.compile_expression_helper(arg, code)?;
+                                
+                                // After compilation, rax contains the result
+                                code.push_str("    call print_decimal_64\n");
+                            }
+                            Expr::String(_, _) => {
+                                // Compile the string
+                                self.compile_expression_helper(arg, code)?;
+                            }
+                            Expr::Var(_, _) => {
+                                // For variables, we need to check their type
+                                // For now, compile and let the variable handling code deal with it
+                                self.compile_expression_helper(arg, code)?;
+                            }
+                            // Handle binary operations - the issue was here
+                            Expr::BinOp { .. } => {
+                                // Handle binary operations by compiling the whole expression
+                                // This will recursively compile the operation
+                                self.compile_expression_helper(arg, code)?;
+                                
+                                // After compilation, rax contains the result
+                                code.push_str("    call print_decimal_64\n");
+                            }
+                            _ => {
+                                return Err(format!("Unsupported print argument type: {:?}", arg));
+                            }
+                        }
+                    } else {
+                        // Empty print() - just print a newline
+                        code.push_str("    ; Empty print - just newline\n");
+                        // BIOS64 doesn't have a newline function, so we print a space
+                        code.push_str("    mov rsi, newline_str\n");
+                        code.push_str("    mov rdi, 0xB8000\n");
+                        code.push_str("    call print_string_64\n");
+                    }
+                }
+                else {
+                    // Regular function call
+                    code.push_str(&format!("    call {}\n", func));
+                }
+                Ok(())
+            }
+            Expr::BinOp { left, op, right, span: _ } => {
+                // Compile left side
+                self.compile_expression_helper(left, code)?;
+                code.push_str("    push rax\n");
+                
+                // Compile right side
+                self.compile_expression_helper(right, code)?;
+                code.push_str("    mov rbx, rax\n");
+                code.push_str("    pop rax\n");
+                
+                match op {
+                    Op::Add => {
+                        code.push_str("    add rax, rbx\n");
+                    }
+                    Op::Sub => {
+                        code.push_str("    sub rax, rbx\n");
+                    }
+                    Op::Mul => {
+                        code.push_str("    imul rax, rbx\n");
+                    }
+                    Op::Div => {
+                        code.push_str("    xor rdx, rdx\n");
+                        code.push_str("    idiv rbx\n");
+                    }
+                    Op::Mod => {
+                        code.push_str("    xor rdx, rdx\n");
+                        code.push_str("    div rbx\n");
+                        code.push_str("    mov rax, rdx\n"); // Remainder
+                    }
+                    _ => {
+                        return Err(format!("Unsupported operator: {:?}", op));
+                    }
+                }
+                Ok(())
+            }
+            _ => {
+                Err(format!("Unsupported expression: {:?}", expr))
+            }
+        }
+    }
 }
 
 impl Backend for Bios64Backend {
@@ -817,7 +1124,6 @@ impl Backend for Bios64Backend {
         asm.push_str("    mov cr0, eax\n\n");
         asm.push_str("    jmp 0x08:protected_mode\n\n");
         
-        // ========== 32-bit code ==========
         asm.push_str("    bits 32\n");
         asm.push_str("protected_mode:\n");
         asm.push_str("    mov ax, 0x10\n");
@@ -876,7 +1182,6 @@ impl Backend for Bios64Backend {
         // Jump to 64-bit mode
         asm.push_str("    jmp 0x08:long_mode\n\n");
         
-        // ========== 64-bit code ==========
         asm.push_str("    bits 64\n");
         asm.push_str("long_mode:\n");
         
@@ -904,7 +1209,8 @@ impl Backend for Bios64Backend {
             match stmt {
                 Statement::Expr(expr) => {
                     asm.push_str("; Expression\n");
-                    asm.push_str(&self.compile_expression(expr)?);
+                    let expr_code = self.compile_expression(expr)?;
+                    asm.push_str(&expr_code);
                 }
                 Statement::FunctionDef { name, args, body, span: _ } => {
                     asm.push_str(&format!("; Function: {}\n", name));
@@ -924,9 +1230,8 @@ impl Backend for Bios64Backend {
                     
                     // Compile function body
                     for body_stmt in body {
-                        if let Statement::Expr(expr) = body_stmt {
-                            asm.push_str(&self.compile_expression(expr)?);
-                        }
+                        // For now, just add a comment
+                        asm.push_str(&format!("    ; Statement: {:?}\n", body_stmt));
                     }
                     
                     asm.push_str(&self.function_epilogue(&BackendFunction {
@@ -935,12 +1240,19 @@ impl Backend for Bios64Backend {
                         body: Vec::new(),
                     }));
                 }
+                Statement::HardwareFunctionDef { device, name, args, body, span: _ } => {
+                    // NEW: Handle hardware function definitions
+                    asm.push_str(&format!("; Hardware function: {} for device {}\n", name, device));
+                    let hw_func_asm = self.compile_hardware_function_def(device, name, args, body)?;
+                    asm.push_str(&hw_func_asm);
+                }
                 Statement::VarDecl { name, value, type_hint: _, span: _ } => {
                     asm.push_str(&format!("; Variable: {}\n", name));
-                    asm.push_str(&self.compile_expression(value)?);
+                    let var_code = self.compile_expression(value)?;
+                    asm.push_str(&var_code);
                 }
                 _ => {
-                    asm.push_str("; [Other statement]\n");
+                    asm.push_str("    ; [Statement type not fully implemented]\n");
                 }
             }
         }
@@ -958,7 +1270,6 @@ impl Backend for Bios64Backend {
         asm.push_str("    hlt\n");
         asm.push_str("    jmp $\n\n");
         
-        // ========== 64-bit subroutines ==========
         asm.push_str("print_string_64:\n");
         asm.push_str("    push rdi\n");
         asm.push_str(".loop:\n");
@@ -1004,7 +1315,10 @@ impl Backend for Bios64Backend {
         asm.push_str("    pop rdi\n");
         asm.push_str("    ret\n\n");
         
-        // ========== GDTs ==========
+        // Add hardware library to the generated code
+        asm.push_str("\n; ========== HARDWARE LIBRARY ==========\n");
+        asm.push_str(&self.hardware_dsl.generate_hardware_library());
+        
         asm.push_str("gdt32:\n");
         asm.push_str("    dq 0x0000000000000000\n");
         asm.push_str("    dq 0x00CF9A000000FFFF\n");
@@ -1025,7 +1339,6 @@ impl Backend for Bios64Backend {
         asm.push_str("    dw gdt64_end - gdt64 - 1\n");
         asm.push_str("    dq gdt64\n\n");
         
-        // ========== Data ==========
         asm.push_str("msg_64:\n");
         asm.push_str("    db 'Rython 64-bit', 0\n\n");
         
@@ -1040,6 +1353,12 @@ impl Backend for Bios64Backend {
         asm.push_str("    dw 0xAA55\n");
         
         Ok(asm)
+    }
+    
+    fn compile_expression(&mut self, expr: &Expr) -> Result<String, String> {
+        let mut code = String::new();
+        self.compile_expression_helper(expr, &mut code)?;
+        Ok(code)
     }
     
     fn function_prologue(&self, func: &BackendFunction) -> String {
@@ -1065,113 +1384,12 @@ impl Backend for Bios64Backend {
         epilogue
     }
     
-    fn compile_expression(&self, expr: &Expr) -> Result<String, String> {
-        let mut code = String::new();
-        
-        match expr {
-            Expr::Number(n, _) => {
-                code.push_str(&format!("    ; Number: {}\n", n));
-                code.push_str(&format!("    mov rax, {}\n", n));
-                code.push_str("    call print_decimal_64\n");
-            }
-            Expr::String(s, _) => {
-                let label = self.get_string_label(s);
-                code.push_str(&format!("    ; String: '{}'\n", s));
-                code.push_str(&format!("    mov rsi, {}\n", label));
-                code.push_str("    mov rdi, 0xB8000\n");
-                code.push_str("    call print_string_64\n");
-            }
-            Expr::Var(name, _) => {
-                // BIOS64 doesn't have proper variable tracking yet
-                code.push_str(&format!("    ; Variable: {} (not implemented in BIOS64)\n", name));
-                // Return a dummy value
-                code.push_str("    mov rax, 0\n");
-            }
-            Expr::Call { func, args, kwargs: _, span: _ } if func == "print" => {
-                if let Some(arg) = args.get(0) {
-                    // Handle each type of argument differently
-                    match arg {
-                        Expr::Number(_, _) => {
-                            // Compile the argument as a number
-                            let compiled = self.compile_expression(arg)?;
-                            code.push_str(&compiled);
-                        }
-                        Expr::String(_, _) => {
-                            // Compile the string
-                            let compiled = self.compile_expression(arg)?;
-                            code.push_str(&compiled);
-                        }
-                        Expr::Var(_, _) => {
-                            // For variables, we need to check their type
-                            // For now, compile and let the variable handling code deal with it
-                            let compiled = self.compile_expression(arg)?;
-                            code.push_str(&compiled);
-                        }
-                        // Handle binary operations - the issue was here
-                        Expr::BinOp { .. } => {
-                            // Handle binary operations by compiling the whole expression
-                            // This will recursively compile the operation
-                            let compiled = self.compile_expression(arg)?;
-                            code.push_str(&compiled);
-                            
-                            // After compilation, rax contains the result
-                            code.push_str("    call print_decimal_64\n");
-                        }
-                        _ => {
-                            return Err(format!("Unsupported print argument type: {:?}", arg));
-                        }
-                    }
-                } else {
-                    // Empty print() - just print a newline
-                    code.push_str("    ; Empty print - just newline\n");
-                    // BIOS64 doesn't have a newline function, so we print a space
-                    code.push_str("    mov rsi, newline_str\n");
-                    code.push_str("    mov rdi, 0xB8000\n");
-                    code.push_str("    call print_string_64\n");
-                }
-            }
-            Expr::BinOp { left, op, right, span: _ } => {
-                // Compile left side
-                let left_code = self.compile_expression(left)?;
-                code.push_str(&left_code);
-                code.push_str("    push rax\n");
-                
-                // Compile right side
-                let right_code = self.compile_expression(right)?;
-                code.push_str(&right_code);
-                code.push_str("    mov rbx, rax\n");
-                code.push_str("    pop rax\n");
-                
-                match op {
-                    Op::Add => {
-                        code.push_str("    add rax, rbx\n");
-                    }
-                    Op::Sub => {
-                        code.push_str("    sub rax, rbx\n");
-                    }
-                    Op::Mul => {
-                        code.push_str("    imul rax, rbx\n");
-                    }
-                    Op::Div => {
-                        code.push_str("    xor rdx, rdx\n");
-                        code.push_str("    idiv rbx\n");
-                    }
-                    Op::Mod => {
-                        code.push_str("    xor rdx, rdx\n");
-                        code.push_str("    div rbx\n");
-                        code.push_str("    mov rax, rdx\n"); // Remainder
-                    }
-                    _ => {
-                        return Err(format!("Unsupported operator: {:?}", op));
-                    }
-                }
-            }
-            _ => {
-                return Err(format!("Unsupported expression: {:?}", expr));
-            }
-        }
-        
-        Ok(code)
+    fn as_any(&self) -> &dyn Any {
+        self
+    }
+    
+    fn as_any_mut(&mut self) -> &mut dyn Any {
+        self
     }
 }
 
@@ -1687,7 +1905,7 @@ impl Backend for Linux64Backend {
     Ok(asm)
 }
     
-    fn compile_expression(&self, expr: &Expr) -> Result<String, String> {
+    fn compile_expression(&mut self, expr: &Expr) -> Result<String, String> {
         match expr {
             Expr::Number(n, _) => {
                 // Load number into rax
@@ -1868,6 +2086,14 @@ impl Backend for Linux64Backend {
         epilogue.push_str("    pop rbp\n");
         epilogue.push_str("    ret\n");
         epilogue
+    }
+    
+    fn as_any(&self) -> &dyn Any {
+        self
+    }
+    
+    fn as_any_mut(&mut self) -> &mut dyn Any {
+        self
     }
 }
 
@@ -2168,7 +2394,7 @@ impl Backend for Windows64Backend {
         "    mov rsp, rbp\n    pop rbp\n    ret\n".to_string()
     }
     
-    fn compile_expression(&self, expr: &Expr) -> Result<String, String> {
+    fn compile_expression(&mut self, expr: &Expr) -> Result<String, String> {
         let mut code = String::new();
         
         match expr {
@@ -2176,8 +2402,6 @@ impl Backend for Windows64Backend {
                 code.push_str(&format!("    ; Number: {}\n", n));
                 code.push_str(&format!("    mov rax, {}\n", n));
                 
-                // For Windows, we need to pass the number correctly to printf
-                // We'll use the %d format specifier for integers
                 code.push_str("    mov rdx, rax          ; Second arg: integer value\n");
                 code.push_str("    lea rcx, [printf_format_int] ; First arg: format string for integer\n");
                 code.push_str("    sub rsp, 32          ; Allocate shadow space\n");
@@ -2318,6 +2542,14 @@ impl Backend for Windows64Backend {
         }
         
         Ok(code)
+    }
+    
+    fn as_any(&self) -> &dyn Any {
+        self
+    }
+    
+    fn as_any_mut(&mut self) -> &mut dyn Any {
+        self
     }
 }
 

@@ -1,3 +1,4 @@
+
 use std::collections::HashMap;
 use serde::{Serialize, Deserialize};
 
@@ -286,6 +287,13 @@ pub enum Statement {
     If { condition: Expr, then_block: Vec<Statement>, elif_blocks: Vec<(Expr, Vec<Statement>)>, else_block: Option<Vec<Statement>>, span: Span },
     While { condition: Expr, body: Vec<Statement>, orelse: Option<Vec<Statement>>, span: Span },
     FunctionDef { name: String, args: Vec<String>, body: Vec<Statement>, span: Span },
+    HardwareFunctionDef { 
+        device: String, 
+        name: String, 
+        args: Vec<String>, 
+        body: Vec<Statement>, 
+        span: Span,
+    },
     Pass,
     Break,
     Continue,
@@ -302,6 +310,7 @@ impl Statement {
             Statement::If { span, .. } => *span,
             Statement::While { span, .. } => *span,
             Statement::FunctionDef { span, .. } => *span,
+            Statement::HardwareFunctionDef { span, .. } => *span,
             Statement::Pass => Span::single(Position::new(0, 0, 0)),
             Statement::Break => Span::single(Position::new(0, 0, 0)),
             Statement::Continue => Span::single(Position::new(0, 0, 0)),
@@ -329,6 +338,10 @@ pub enum TokenKind {
     Var, If, Elif, Else, While, For, In, Return, Def,
     And, Or, Not, Pass, Break, Continue,
     True, False, None,
+    
+    // Decorators and punctuation
+    At,      // NEW: For @gpu.def etc
+    Dot,     // NEW: For . separator
     
     // Literals
     Number(i64),
@@ -369,6 +382,8 @@ impl TokenKind {
             TokenKind::True => "True".to_string(),
             TokenKind::False => "False".to_string(),
             TokenKind::None => "None".to_string(),
+            TokenKind::At => "@".to_string(),           // NEW
+            TokenKind::Dot => ".".to_string(),          // NEW
             TokenKind::Number(n) => n.to_string(),
             TokenKind::Float(f) => f.to_string(),
             TokenKind::String(s) => format!("\"{}\"", s),
@@ -432,51 +447,51 @@ pub fn lex(input: &str) -> Result<Vec<Token>, ParseError> {
                 }
             }
             '"' | '\'' => {
-    let quote = chars.next().unwrap();
-    pos.advance(quote);
-    let mut s = String::new();
-    let mut escape = false;
-    let mut closed = false;
-    
-    while let Some(ch) = chars.next() {
-        if escape {
-            s.push(match ch {
-                'n' => '\n', 't' => '\t', 'r' => '\r',
-                '\\' => '\\', '\'' => '\'', '"' => '"',
-                _ => {
-                    return Err(ParseError::lex_error(
-                        format!("Invalid escape sequence '\\{}'", ch),
-                        Span::single(pos)
-                    ).with_help("Valid escape sequences: \\n, \\t, \\r, \\\\, \\', \\\""));
+                let quote = chars.next().unwrap();
+                pos.advance(quote);
+                let mut s = String::new();
+                let mut escape = false;
+                let mut closed = false;
+                
+                while let Some(ch) = chars.next() {
+                    if escape {
+                        s.push(match ch {
+                            'n' => '\n', 't' => '\t', 'r' => '\r',
+                            '\\' => '\\', '\'' => '\'', '"' => '"',
+                            _ => {
+                                return Err(ParseError::lex_error(
+                                    format!("Invalid escape sequence '\\{}'", ch),
+                                    Span::single(pos)
+                                ).with_help("Valid escape sequences: \\n, \\t, \\r, \\\\, \\', \\\""));
+                            }
+                        });
+                        escape = false;
+                    } else if ch == '\\' {
+                        escape = true;
+                    } else if ch == quote {
+                        closed = true;
+                        break;
+                    } else {
+                        s.push(ch);
+                    }
+                    pos.advance(ch);
                 }
-            });
-            escape = false;
-        } else if ch == '\\' {
-            escape = true;
-        } else if ch == quote {
-            closed = true;
-            break;
-        } else {
-            s.push(ch);
-        }
-        pos.advance(ch);
-    }
-    
-    if !closed {
-        return Err(ParseError::lex_error(
-            format!("Unclosed string literal starting with '{}'", quote),
-            Span::new(start_pos, pos)
-        ).with_help("Close the string with matching quote"));
-    }
-    
-    let span = Span::new(start_pos, pos);
-    let lexeme = input[start_pos.offset..pos.offset].to_string();
-    tokens.push(Token {
-        kind: TokenKind::String(s),
-        span,
-        lexeme,
-    });
-}
+                
+                if !closed {
+                    return Err(ParseError::lex_error(
+                        format!("Unclosed string literal starting with '{}'", quote),
+                        Span::new(start_pos, pos)
+                    ).with_help("Close the string with matching quote"));
+                }
+                
+                let span = Span::new(start_pos, pos);
+                let lexeme = input[start_pos.offset..pos.offset].to_string();
+                tokens.push(Token {
+                    kind: TokenKind::String(s),
+                    span,
+                    lexeme,
+                });
+            }
             '0'..='9' => {
                 let mut num = String::new();
                 let mut is_float = false;
@@ -823,6 +838,26 @@ pub fn lex(input: &str) -> Result<Vec<Token>, ParseError> {
                     lexeme: ";".to_string(),
                 });
             }
+            '@' => {  // NEW: At token for decorators
+                chars.next();
+                pos.advance('@');
+                let span = Span::single(start_pos);
+                tokens.push(Token {
+                    kind: TokenKind::At,
+                    span,
+                    lexeme: "@".to_string(),
+                });
+            }
+            '.' => {  // NEW: Dot token for device.def
+                chars.next();
+                pos.advance('.');
+                let span = Span::single(start_pos);
+                tokens.push(Token {
+                    kind: TokenKind::Dot,
+                    span,
+                    lexeme: ".".to_string(),
+                });
+            }
             _ => {
                 return Err(ParseError::lex_error(
                     format!("Unexpected character '{}'", c),
@@ -889,6 +924,7 @@ impl<'a> Parser<'a> {
         let start = self.current().span;
         
         match &self.current().kind {
+            TokenKind::At => self.parse_hardware_decorator(start), // NEW!
             TokenKind::Var => self.parse_var_decl(start),
             TokenKind::If => self.parse_if_statement(start),
             TokenKind::While => self.parse_while_statement(start),
@@ -956,6 +992,98 @@ impl<'a> Parser<'a> {
                 Ok(Statement::Expr(expr))
             }
         }
+    }
+    
+    fn parse_hardware_decorator(&mut self, start: Span) -> Result<Statement, ParseError> { 
+        self.consume(TokenKind::At)?; 
+        
+        // Parse device name (e.g. gpu, network_card) 
+        let device_name = match &self.current().kind { 
+            TokenKind::Identifier(name) => { 
+                let name = name.clone(); 
+                self.advance(); 
+                name 
+            } 
+            _ => return Err(ParseError::syntax_error( 
+                "Expected device name after '@'", 
+                self.current().span 
+            )), 
+        }; 
+        
+        self.consume(TokenKind::Dot)?; // gpu.def 
+        
+        let operation = match &self.current().kind { 
+            TokenKind::Identifier(op) => { 
+                let op = op.clone(); 
+                self.advance(); 
+                op 
+            } 
+            _ => return Err(ParseError::syntax_error( 
+                "Expected operation (def, call, etc)", 
+                self.current().span 
+            )), 
+        }; 
+        
+        // Parse function definition or call 
+        match operation.as_str() { 
+            "def" => self.parse_hardware_function_def(start, device_name),
+            _ => Err(ParseError::syntax_error( 
+                format!("Unknown hardware operation '{}'", operation), 
+                self.current().span 
+            )), 
+        }
+    }
+    
+    fn parse_hardware_function_def(&mut self, start: Span, device: String) -> Result<Statement, ParseError> {
+        // Parse function name
+        let name = match &self.current().kind {
+            TokenKind::Identifier(name) => {
+                let name = name.clone();
+                self.advance();
+                name
+            }
+            _ => return Err(ParseError::syntax_error(
+                "Expected hardware function name",
+                self.current().span
+            )),
+        };
+        
+        self.consume(TokenKind::LParen)?;
+        let mut args = Vec::new();
+        
+        while !matches!(self.current().kind, TokenKind::RParen) {
+            match &self.current().kind {
+                TokenKind::Identifier(arg) => {
+                    args.push(arg.clone());
+                    self.advance();
+                }
+                _ => {
+                    return Err(ParseError::syntax_error(
+                        "Expected argument name",
+                        self.current().span
+                    ));
+                }
+            }
+            
+            if matches!(self.current().kind, TokenKind::Comma) {
+                self.advance();
+            } else {
+                break;
+            }
+        }
+        
+        self.consume(TokenKind::RParen)?;
+        self.consume(TokenKind::Colon)?;
+        self.skip_newlines();
+        let body = self.parse_block()?;
+        
+        Ok(Statement::HardwareFunctionDef { 
+            device, 
+            name, 
+            args, 
+            body,
+            span: start 
+        })
     }
     
     fn parse_var_decl(&mut self, start: Span) -> Result<Statement, ParseError> {
@@ -1456,6 +1584,8 @@ impl<'a> Parser<'a> {
                 TokenKind::While => "'while'",
                 TokenKind::Return => "'return'",
                 TokenKind::Def => "'def'",
+                TokenKind::At => "'@'",           // NEW
+                TokenKind::Dot => "'.'",          // NEW
                 TokenKind::Colon => "':'",
                 TokenKind::LParen => "'('",
                 TokenKind::RParen => "')'",
