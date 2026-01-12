@@ -149,6 +149,182 @@ impl FunctionContext {
     }
 }
 
+/// Trait for Earthng language extension modules
+pub trait EarthngModule {
+    /// Name of the module
+    fn name(&self) -> &str;
+    
+    /// Description of the module
+    fn description(&self) -> &str;
+    
+    /// Functions provided by this module
+    fn functions(&self) -> Vec<&str>;
+    
+    /// Compile a function call to assembly
+    fn compile_function(
+        &self, 
+        func: &str, 
+        args: &[crate::parser::Expr], 
+        target: &Target,
+        emitter: &mut dyn AssemblyEmitter
+    ) -> Result<String, String>;
+    
+    /// Initialize the module with required capabilities
+    fn init(&mut self, capabilities: &[Capability]);
+    
+    /// Check if module supports a specific function
+    fn supports_function(&self, func: &str) -> bool {
+        self.functions().contains(&func)
+    }
+}
+
+/// Trait for emitting assembly code from modules
+pub trait AssemblyEmitter {
+    fn emit_call(&mut self, func: &str, args: &[String]) -> String;
+    fn emit_reg_move(&mut self, src: &str, dst: &str) -> String;
+    fn emit_label(&mut self, label: &str) -> String;
+    fn emit_comment(&mut self, comment: &str) -> String;
+}
+
+/// Basic assembly emitter implementation
+pub struct BasicAssemblyEmitter {
+    target: Target,
+}
+
+impl BasicAssemblyEmitter {
+    pub fn new(target: Target) -> Self {
+        Self { target }
+    }
+}
+
+impl AssemblyEmitter for BasicAssemblyEmitter {
+    fn emit_call(&mut self, func: &str, args: &[String]) -> String {
+        match self.target {
+            Target::Linux64 => {
+                // Linux x86_64 calling convention: rdi, rsi, rdx, rcx, r8, r9
+                let mut asm = String::new();
+                for (i, arg) in args.iter().enumerate() {
+                    match i {
+                        0 => asm.push_str(&format!("    mov rdi, {}\n", arg)),
+                        1 => asm.push_str(&format!("    mov rsi, {}\n", arg)),
+                        2 => asm.push_str(&format!("    mov rdx, {}\n", arg)),
+                        3 => asm.push_str(&format!("    mov rcx, {}\n", arg)),
+                        4 => asm.push_str(&format!("    mov r8, {}\n", arg)),
+                        5 => asm.push_str(&format!("    mov r9, {}\n", arg)),
+                        _ => asm.push_str(&format!("    push {}\n", arg)),
+                    }
+                }
+                if args.len() > 6 {
+                    asm.push_str(&format!("    ; {} stack args passed\n", args.len() - 6));
+                }
+                asm.push_str(&format!("    call {}\n", func));
+                asm
+            }
+            Target::Windows64 => {
+                // Windows x64 calling convention: rcx, rdx, r8, r9
+                let mut asm = String::new();
+                for (i, arg) in args.iter().enumerate() {
+                    match i {
+                        0 => asm.push_str(&format!("    mov rcx, {}\n", arg)),
+                        1 => asm.push_str(&format!("    mov rdx, {}\n", arg)),
+                        2 => asm.push_str(&format!("    mov r8, {}\n", arg)),
+                        3 => asm.push_str(&format!("    mov r9, {}\n", arg)),
+                        _ => asm.push_str(&format!("    mov [rsp+{}], {}\n", (i - 4) * 8, arg)),
+                    }
+                }
+                asm.push_str(&format!("    call {}\n", func));
+                asm
+            }
+            Target::Bios64 => {
+                // BIOS calling convention for our system
+                let mut asm = String::new();
+                for (i, arg) in args.iter().enumerate() {
+                    match i {
+                        0 => asm.push_str(&format!("    mov rax, {}\n", arg)),
+                        1 => asm.push_str(&format!("    mov rbx, {}\n", arg)),
+                        2 => asm.push_str(&format!("    mov rcx, {}\n", arg)),
+                        3 => asm.push_str(&format!("    mov rdx, {}\n", arg)),
+                        _ => asm.push_str(&format!("    ; arg{}: {}\n", i, arg)),
+                    }
+                }
+                asm.push_str(&format!("    call {}\n", func));
+                asm
+            }
+            _ => format!("    ; call {} - target not implemented\n", func),
+        }
+    }
+    
+    fn emit_reg_move(&mut self, src: &str, dst: &str) -> String {
+        format!("    mov {}, {}\n", dst, src)
+    }
+    
+    fn emit_label(&mut self, label: &str) -> String {
+        format!("{}:\n", label)
+    }
+    
+    fn emit_comment(&mut self, comment: &str) -> String {
+        format!("    ; {}\n", comment)
+    }
+}
+
+/// Extension Registry for dynamic module loading
+pub struct ExtensionRegistry {
+    modules: Vec<Box<dyn EarthngModule>>,
+    loaded_modules: HashMap<String, Box<dyn EarthngModule>>,
+}
+
+impl ExtensionRegistry {
+    pub fn new() -> Self {
+        Self {
+            modules: Vec::new(),
+            loaded_modules: HashMap::new(),
+        }
+    }
+    
+    /// Register a new module
+    pub fn register_module(&mut self, module: Box<dyn EarthngModule>) {
+        let name = module.name().to_string();
+        self.modules.push(module);
+        // Load the first instance
+        if !self.loaded_modules.contains_key(&name) {
+            // We can't load the same module twice from the vector, so we'll create a new instance
+            // In a real implementation, we'd clone or use Arc
+        }
+    }
+    
+    /// Find a module that supports a function
+    pub fn find_module_for_function(&self, func: &str) -> Option<&dyn EarthngModule> {
+        for module in &self.modules {
+            if module.supports_function(func) {
+                return Some(module.as_ref());
+            }
+        }
+        None
+    }
+    
+    /// Get all registered modules
+    pub fn modules(&self) -> &[Box<dyn EarthngModule>] {
+        &self.modules
+    }
+    
+    /// Load a module by name
+    pub fn load_module(&mut self, name: &str) -> Result<(), String> {
+        for module in &self.modules {
+            if module.name() == name {
+                // Note: We can't clone a Box<dyn EarthngModule> easily
+                // This is a placeholder - in real implementation we'd need CloneBox trait
+                return Err("Module cloning not implemented".to_string());
+            }
+        }
+        Err(format!("Module '{}' not found", name))
+    }
+    
+    /// Check if a function is available in any module
+    pub fn has_function(&self, func: &str) -> bool {
+        self.find_module_for_function(func).is_some()
+    }
+}
+
 pub trait Backend {
     /// Backend name for debugging
     fn name(&self) -> &str;

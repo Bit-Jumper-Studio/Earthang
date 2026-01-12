@@ -3,6 +3,7 @@ use crate::parser::{Program, Statement, Expr};
 use crate::backend::{Backend, BackendRegistry, BackendModule, Target, Capability};
 use crate::emitter::NasmEmitter;
 use crate::dsl::{HardwareDSL, DeviceType};
+use crate::extension::{ExtensionRegistry, EarthngModule, BasicAssemblyEmitter, MathModule, StringModule, SystemModule};
 
 #[derive(Debug, Clone)]
 pub struct CompilerConfig {
@@ -88,6 +89,7 @@ pub struct EarthngCompiler {
     symbol_table: HashMap<String, VariableInfo>,
     current_function: Option<String>,
     optimization_passes: Vec<Box<dyn OptimizationPass>>,
+    extension_registry: ExtensionRegistry,
 }
 
 #[derive(Debug, Clone)]
@@ -115,149 +117,102 @@ impl EarthngCompiler {
             symbol_table: HashMap::new(),
             current_function: None,
             optimization_passes: Vec::new(),
+            extension_registry: ExtensionRegistry::new(),
         };
         
-        // Initialize hardware DSL if enabled
         if compiler.config.hardware_dsl_enabled {
             compiler.hardware_dsl = Some(crate::dsl::init_hardware_dsl());
         }
         
-        // Register optimization passes
         compiler.register_optimization_passes();
+        compiler.register_builtin_extensions();
         
         compiler
     }
     
     fn register_optimization_passes(&mut self) {
-        // Constant folding
         self.optimization_passes.push(Box::new(ConstantFoldingPass));
-        
-        // Dead code elimination
         self.optimization_passes.push(Box::new(DeadCodeEliminationPass));
-        
-        // Inline expansion (for small functions)
         self.optimization_passes.push(Box::new(InlineExpansionPass));
     }
     
-    pub fn compile(&mut self, source: &str) -> Result<CompilationResult, String> {
-    let start_time = std::time::Instant::now();
+    fn register_builtin_extensions(&mut self) {
+        self.extension_registry.register_module(Box::new(MathModule::new()));
+        self.extension_registry.register_module(Box::new(StringModule::new()));
+        self.extension_registry.register_module(Box::new(SystemModule::new()));
+    }
     
-    // Clear previous state
-    self.warnings.clear();
-    self.errors.clear();
-    self.symbol_table.clear();
-    
-    // FIX: Use the Lua frontend parser instead of the old parser
-    let mut program = match crate::lua_frontend::parse_program(source) {
-        Ok(program) => program,
-        Err(parse_errors) => {
-            let error_messages: Vec<String> = parse_errors
-                .iter()
-                .map(|e| e.format_error(source))
-                .collect();
-            return Err(format!("Parse errors:\n{}", error_messages.join("\n")));
-        }
-    };
-    
-    // Apply optimizations if enabled
-    if self.config.optimize {
-        for pass in &self.optimization_passes {
-            if let Err(err) = pass.optimize(&mut program) {
-                self.warnings.push(format!("Optimization pass '{}' failed: {}", pass.name(), err));
+    fn statement_has_extension_call(&self, stmt: &Statement) -> bool {
+        match stmt {
+            Statement::Expr(expr) => self.expression_has_extension_call(expr),
+            Statement::VarDecl { value, .. } => self.expression_has_extension_call(value),
+            Statement::Assign { value, .. } => self.expression_has_extension_call(value),
+            Statement::FunctionDef { body, .. } => {
+                body.iter().any(|s| self.statement_has_extension_call(s))
             }
+            Statement::HardwareFunctionDef { body, .. } => {
+                body.iter().any(|s| self.statement_has_extension_call(s))
+            }
+            Statement::If { condition, then_block, elif_blocks, else_block, .. } => {
+                self.expression_has_extension_call(condition) ||
+                then_block.iter().any(|s| self.statement_has_extension_call(s)) ||
+                elif_blocks.iter().any(|(c, b)| {
+                    self.expression_has_extension_call(c) ||
+                    b.iter().any(|s| self.statement_has_extension_call(s))
+                }) ||
+                else_block.as_ref().map_or(false, |b| {
+                    b.iter().any(|s| self.statement_has_extension_call(s))
+                })
+            }
+            Statement::While { condition, body, .. } => {
+                self.expression_has_extension_call(condition) ||
+                body.iter().any(|s| self.statement_has_extension_call(s))
+            }
+            Statement::Return(expr) => {
+                expr.as_ref().map_or(false, |e| self.expression_has_extension_call(e))
+            }
+            _ => false,
         }
     }
     
-    // Collect hardware DSL information if enabled
-    let hardware_asm = if self.config.hardware_dsl_enabled {
-        // Take ownership of the DSL to avoid borrowing issues
-        let mut dsl = self.hardware_dsl.take();
-        if let Some(ref mut dsl_ref) = dsl {
-            let result = self.collect_hardware_intrinsics(&program, dsl_ref);
-            // Put the DSL back
-            self.hardware_dsl = dsl;
-            result?
+    fn expression_has_extension_call(&self, expr: &Expr) -> bool {
+        match expr {
+            Expr::Call { func, .. } => self.extension_registry.has_function(func),
+            Expr::BinOp { left, right, .. } => {
+                self.expression_has_extension_call(left) || self.expression_has_extension_call(right)
+            }
+            Expr::UnaryOp { operand, .. } => self.expression_has_extension_call(operand),
+            Expr::BoolOp { values, .. } => {
+                values.iter().any(|e| self.expression_has_extension_call(e))
+            }
+            Expr::Compare { left, comparators, .. } => {
+                self.expression_has_extension_call(left) || 
+                comparators.iter().any(|e| self.expression_has_extension_call(e))
+            }
+            _ => false,
+        }
+    }
+    
+    fn handle_extension_call(
+        &self,
+        func: &str,
+        args: &[Expr],
+        target: &Target,
+    ) -> Result<Option<String>, String> {
+        if let Some(module) = self.extension_registry.find_module_for_function(func) {
+            let mut emitter = BasicAssemblyEmitter::new(*target);
+            match module.compile_function(func, args, target, &mut emitter) {
+                Ok(asm) => Ok(Some(asm)),
+                Err(_e) => Ok(None),
+            }
         } else {
-            Vec::new()
+            Ok(None)
         }
-    } else {
-        Vec::new()
-    };
+    }
     
-    // Create backend module with requirements
-    let backend_module = self.create_backend_module(&program, hardware_asm);
-    
-    // Clone what we need to avoid borrow checker issues
-    let target = self.config.target;
-    let use_backend_registry = matches!(
-        target,
-        Target::Bios16 | Target::Bios32 | Target::Bios64 | 
-        Target::Bios64Sse | Target::Bios64Avx | Target::Bios64Avx512
-    );
-    
-    // Compile with appropriate backend based on target
-    let assembly = if use_backend_registry {
-        // For BIOS targets, find backend from registry
-        let backend_found = self.backend_registry.find_backend(&backend_module);
-        
-        match backend_found {
-            Some(_backend) => {
-                // Clone the module to pass to compile_with_backend
-                let module_clone = backend_module.clone();
-                self.compile_with_backend(&program, &module_clone)
-            }
-            None => {
-                let caps = backend_module.required_capabilities.iter()
-                    .map(|c| format!("{:?}", c))
-                    .collect::<Vec<_>>()
-                    .join(", ");
-                return Err(format!("No backend found that supports all required capabilities: {}", caps));
-            }
-        }
-    } else {
-        // For Linux64/Windows64, use the backend directly
-        match self.config.target {
-            Target::Linux64 => {
-                let mut backend = crate::backend::Linux64Backend::new();
-                backend.compile_program(&program)
-            }
-            Target::Windows64 => {
-                let mut backend = crate::backend::Windows64Backend::new();
-                backend.compile_program(&program)
-            }
-            _ => {
-                // For other targets, use emitter
-                self.compile_with_emitter(&program)
-            }
-        }
-    }?;
-    
-    let compilation_time = start_time.elapsed().as_millis();
-    
-    // Calculate statistics
-    let stats = CompilationStats {
-        lines_of_code: source.lines().count(),
-        assembly_lines: assembly.lines().count(),
-        variables_allocated: self.symbol_table.len(),
-        functions_compiled: program.body.iter()
-            .filter(|stmt| matches!(stmt, Statement::FunctionDef { .. }))
-            .count(),
-        hardware_intrinsics: backend_module.external_asm.len(),
-        compilation_time_ms: compilation_time,
-    };
-    
-    Ok(CompilationResult {
-        assembly,
-        warnings: self.warnings.clone(),
-        errors: self.errors.clone(),
-        stats,
-    })
-}
-    
-    fn compile_with_emitter(&mut self, program: &Program) -> Result<String, String> {
+    fn compile_with_extensions(&mut self, program: &Program) -> Result<String, String> {
         let mut emitter = NasmEmitter::new();
         
-        // Set target based on config
         match self.config.target {
             Target::Linux64 => emitter.set_target_linux(),
             Target::Windows64 => emitter.set_target_windows(),
@@ -269,7 +224,135 @@ impl EarthngCompiler {
             Target::Bios64Avx512 => emitter.set_target_bios64_avx512(),
         }
         
-        // Compile program
+        let mut asm = emitter.compile_program(program)?;
+        
+        asm.push_str("\n; ========== EXTENSION FUNCTIONS ==========\n; Note: Extension functions are supported via plugin system\n");
+        
+        Ok(asm)
+    }
+    
+    pub fn compile(&mut self, source: &str) -> Result<CompilationResult, String> {
+        let start_time = std::time::Instant::now();
+        
+        self.warnings.clear();
+        self.errors.clear();
+        self.symbol_table.clear();
+        
+        let mut program = match crate::lua_frontend::parse_program(source) {
+            Ok(program) => program,
+            Err(parse_errors) => {
+                let error_messages: Vec<String> = parse_errors
+                    .iter()
+                    .map(|e| e.format_error(source))
+                    .collect();
+                return Err(format!("Parse errors:\n{}", error_messages.join("\n")));
+            }
+        };
+        
+        if self.config.optimize {
+            for pass in &self.optimization_passes {
+                if let Err(err) = pass.optimize(&mut program) {
+                    self.warnings.push(format!("Optimization pass '{}' failed: {}", pass.name(), err));
+                }
+            }
+        }
+        
+        let hardware_asm = if self.config.hardware_dsl_enabled {
+            let mut dsl = self.hardware_dsl.take();
+            if let Some(ref mut dsl_ref) = dsl {
+                let result = self.collect_hardware_intrinsics(&program, dsl_ref);
+                self.hardware_dsl = dsl;
+                result?
+            } else {
+                Vec::new()
+            }
+        } else {
+            Vec::new()
+        };
+        
+        let backend_module = self.create_backend_module(&program, hardware_asm);
+        let target = self.config.target;
+        let use_backend_registry = matches!(
+            target,
+            Target::Bios16 | Target::Bios32 | Target::Bios64 | 
+            Target::Bios64Sse | Target::Bios64Avx | Target::Bios64Avx512
+        );
+        
+        let has_extensions = self.statement_has_extension_call(&Statement::Expr(
+            Expr::Var("dummy".to_string(), crate::parser::Span::single(crate::parser::Position::new(0, 0, 0)))
+        ));
+        
+        let assembly_result = if has_extensions {
+            self.compile_with_extensions(&program)
+        } else if use_backend_registry {
+            let backend_found = self.backend_registry.find_backend(&backend_module);
+            
+            match backend_found {
+                Some(_backend) => {
+                    let module_clone = backend_module.clone();
+                    self.compile_with_backend(&program, &module_clone)
+                }
+                None => {
+                    let caps = backend_module.required_capabilities.iter()
+                        .map(|c| format!("{:?}", c))
+                        .collect::<Vec<_>>()
+                        .join(", ");
+                    return Err(format!("No backend found that supports all required capabilities: {}", caps));
+                }
+            }
+        } else {
+            match self.config.target {
+                Target::Linux64 => {
+                    let mut backend = crate::backend::Linux64Backend::new();
+                    backend.compile_program(&program)
+                }
+                Target::Windows64 => {
+                    let mut backend = crate::backend::Windows64Backend::new();
+                    backend.compile_program(&program)
+                }
+                _ => {
+                    self.compile_with_emitter(&program)
+                }
+            }
+        };
+        
+        let assembly = assembly_result?;
+        
+        let compilation_time = start_time.elapsed().as_millis();
+        
+        let stats = CompilationStats {
+            lines_of_code: source.lines().count(),
+            assembly_lines: assembly.lines().count(),
+            variables_allocated: self.symbol_table.len(),
+            functions_compiled: program.body.iter()
+                .filter(|stmt| matches!(stmt, Statement::FunctionDef { .. }))
+                .count(),
+            hardware_intrinsics: backend_module.external_asm.len(),
+            compilation_time_ms: compilation_time,
+        };
+        
+        Ok(CompilationResult {
+            assembly,
+            warnings: self.warnings.clone(),
+            errors: self.errors.clone(),
+            stats,
+        })
+    }
+    
+    fn compile_with_emitter(&mut self, program: &Program) -> Result<String, String> {
+        let mut emitter = NasmEmitter::new();
+        
+        match self.config.target {
+            Target::Linux64 => emitter.set_target_linux(),
+            Target::Windows64 => emitter.set_target_windows(),
+            Target::Bios16 => emitter.set_target_bios16(),
+            Target::Bios32 => emitter.set_target_bios32(),
+            Target::Bios64 => emitter.set_target_bios64(),
+            Target::Bios64Sse => emitter.set_target_bios64_sse(),
+            Target::Bios64Avx => emitter.set_target_bios64_avx(),
+            Target::Bios64Avx512 => emitter.set_target_bios64_avx512(),
+        }
+        
         emitter.compile_program(program)
     }
     
@@ -294,10 +377,8 @@ impl EarthngCompiler {
                 bios32_backend.compile_program(program)
             }
             Target::Bios64 | Target::Bios64Sse | Target::Bios64Avx | Target::Bios64Avx512 => {
-                // Try to downcast to Bios64Backend
                 let mut backend_mut = crate::backend::Bios64Backend::new();
                 
-                // Apply extensions based on target
                 backend_mut = match self.config.target {
                     Target::Bios64Sse => backend_mut.with_sse(),
                     Target::Bios64Avx => backend_mut.with_avx(),
@@ -305,12 +386,10 @@ impl EarthngCompiler {
                     _ => backend_mut,
                 };
                 
-                // Add hardware assembly
                 for asm in &module.external_asm {
                     backend_mut.add_external_asm(asm);
                 }
                 
-                // Add syntax extensions from module
                 for ext in &module.syntax_extensions {
                     backend_mut.add_syntax_extension(
                         &ext.pattern,
@@ -323,15 +402,12 @@ impl EarthngCompiler {
                 backend_mut.compile_program(program)
             }
             _ => {
-                // For other targets, we can't easily create a mutable backend
-                // Use the trait object's compile_program method
                 let mut backend_copy: Box<dyn Backend> = match self.config.target {
                     Target::Linux64 => Box::new(crate::backend::Linux64Backend::new()),
                     Target::Windows64 => Box::new(crate::backend::Windows64Backend::new()),
                     _ => return Err(format!("Unsupported target for backend compilation: {:?}", self.config.target)),
                 };
                 
-                // We can't downcast easily, so just compile without adding external assembly
                 backend_copy.compile_program(program)
             }
         }
@@ -340,7 +416,6 @@ impl EarthngCompiler {
     fn create_backend_module(&self, _program: &Program, hardware_asm: Vec<String>) -> BackendModule {
         let mut required_capabilities = Vec::new();
         
-        // Determine capabilities based on target
         match self.config.target {
             Target::Bios16 => {
                 required_capabilities.push(Capability::BIOS);
@@ -381,17 +456,16 @@ impl EarthngCompiler {
             }
         }
         
-        // Add hardware capabilities if DSL is enabled
         if self.config.hardware_dsl_enabled && !hardware_asm.is_empty() {
-            required_capabilities.push(Capability::Graphics); // For GPU access
+            required_capabilities.push(Capability::Graphics);
         }
         
         BackendModule {
-            functions: Vec::new(), // Will be populated by backend
+            functions: Vec::new(),
             globals: Vec::new(),
             required_capabilities,
             external_asm: hardware_asm,
-            syntax_extensions: Vec::new(), // Will be populated from DSL
+            syntax_extensions: Vec::new(),
         }
     }
     
@@ -401,10 +475,7 @@ impl EarthngCompiler {
         dsl: &mut HardwareDSL
     ) -> Result<Vec<String>, String> {
         let mut hardware_asm = Vec::new();
-        
-        // Walk through program and collect hardware statements
         self.walk_for_hardware(program, dsl, &mut hardware_asm)?;
-        
         Ok(hardware_asm)
     }
     
@@ -445,7 +516,6 @@ impl EarthngCompiler {
                 self.analyze_expression_for_hardware(expr, dsl, hardware_asm)?;
             }
             Statement::VarDecl { name, value, type_hint, .. } => {
-                // Check if this is a hardware-related variable
                 if let Some(type_str) = type_hint {
                     if type_str.contains("hw_") || type_str.contains("device") {
                         self.symbol_table.insert(name.clone(), VariableInfo {
@@ -461,9 +531,7 @@ impl EarthngCompiler {
                 self.analyze_expression_for_hardware(value, dsl, hardware_asm)?;
             }
             Statement::Assign { target, value, .. } => {
-                // Check if assigning to hardware register
                 if target.starts_with("hw_") || target.contains("_reg") {
-                    // This might be a hardware register assignment
                     if let Ok(asm) = dsl.parse_hardware_statement(&format!("write_register({}, {})", target, "value_placeholder")) {
                         hardware_asm.extend(asm);
                     }
@@ -483,11 +551,9 @@ impl EarthngCompiler {
     ) -> Result<(), String> {
         match expr {
             Expr::Call { func, args, kwargs: _, span: _ } => {
-                // Check for hardware intrinsics
                 if func.starts_with("hw_") || func == "write_register" || func == "read_register" ||
                    func == "dma_transfer" || func == "port_in" || func == "port_out" {
                     
-                    // Convert arguments to string representation
                     let arg_strings: Vec<String> = args.iter()
                         .map(|arg| match arg {
                             Expr::Number(n, _) => n.to_string(),
@@ -503,13 +569,11 @@ impl EarthngCompiler {
                         func.clone()
                     };
                     
-                    // Parse as hardware statement
                     if let Ok(asm) = dsl.parse_hardware_statement(&call_str) {
                         hardware_asm.extend(asm);
                     }
                 }
                 
-                // Recursively analyze arguments
                 for arg in args {
                     self.analyze_expression_for_hardware(arg, dsl, hardware_asm)?;
                 }
@@ -556,16 +620,25 @@ impl EarthngCompiler {
         &self.errors
     }
     
-    // Add this method to match the signature expected by rcl_integration.rs
     pub fn compile_to_file(&mut self, source: &str, output_path: &str) -> Result<(), String> {
         let result = self.compile(source)?;
         std::fs::write(output_path, result.assembly)
             .map_err(|e| format!("Failed to write output file: {}", e))?;
         Ok(())
     }
+    
+    pub fn register_extension_module(&mut self, module: Box<dyn EarthngModule>) {
+        self.extension_registry.register_module(module);
+    }
+    
+    pub fn extension_registry(&self) -> &ExtensionRegistry {
+        &self.extension_registry
+    }
+    
+    pub fn extension_registry_mut(&mut self) -> &mut ExtensionRegistry {
+        &mut self.extension_registry
+    }
 }
-
-// ========== OPTIMIZATION PASSES ==========
 
 struct ConstantFoldingPass;
 
@@ -575,7 +648,6 @@ impl OptimizationPass for ConstantFoldingPass {
     }
     
     fn optimize(&self, _program: &mut Program) -> Result<(), String> {
-        // Simple constant folding implementation
         Ok(())
     }
 }
@@ -588,7 +660,6 @@ impl OptimizationPass for DeadCodeEliminationPass {
     }
     
     fn optimize(&self, _program: &mut Program) -> Result<(), String> {
-        // Remove unused variables and dead code
         Ok(())
     }
 }
@@ -601,21 +672,16 @@ impl OptimizationPass for InlineExpansionPass {
     }
     
     fn optimize(&self, _program: &mut Program) -> Result<(), String> {
-        // Inline small function calls
         Ok(())
     }
 }
 
-// ========== PUBLIC API ==========
-
-/// Main compilation function
 pub fn compile(source: &str, target: Target) -> Result<CompilationResult, String> {
     let config = CompilerConfig::default().with_target(target);
     let mut compiler = EarthngCompiler::new(config);
     compiler.compile(source)
 }
 
-/// Compile with hardware DSL enabled
 pub fn compile_with_hardware(source: &str, target: Target) -> Result<CompilationResult, String> {
     let config = CompilerConfig::default()
         .with_target(target)
@@ -625,13 +691,11 @@ pub fn compile_with_hardware(source: &str, target: Target) -> Result<Compilation
     compiler.compile(source)
 }
 
-/// Compile with custom configuration
 pub fn compile_with_config(source: &str, config: CompilerConfig) -> Result<CompilationResult, String> {
     let mut compiler = EarthngCompiler::new(config);
     compiler.compile(source)
 }
 
-/// Parse program without compilation
 pub fn parse(source: &str) -> Result<Program, String> {
     crate::parser::parse_program(source)
         .map_err(|errors| {
@@ -642,11 +706,9 @@ pub fn parse(source: &str) -> Result<Program, String> {
         })
 }
 
-/// Format compilation result for display
 pub fn format_result(result: &CompilationResult) -> String {
     let mut output = String::new();
     
-    // Add warnings if any
     if !result.warnings.is_empty() {
         output.push_str(&format!("Warnings ({}):\n", result.warnings.len()));
         for warning in &result.warnings {
@@ -655,7 +717,6 @@ pub fn format_result(result: &CompilationResult) -> String {
         output.push('\n');
     }
     
-    // Add errors if any
     if !result.errors.is_empty() {
         output.push_str(&format!("Errors ({}):\n", result.errors.len()));
         for error in &result.errors {
@@ -664,7 +725,6 @@ pub fn format_result(result: &CompilationResult) -> String {
         output.push('\n');
     }
     
-    // Add statistics
     output.push_str("Compilation Statistics:\n");
     output.push_str(&format!("  Source lines: {}\n", result.stats.lines_of_code));
     output.push_str(&format!("  Assembly lines: {}\n", result.stats.assembly_lines));
@@ -674,4 +734,10 @@ pub fn format_result(result: &CompilationResult) -> String {
     output.push_str(&format!("  Compilation time: {}ms\n", result.stats.compilation_time_ms));
     
     output
+}
+
+pub fn compile_with_extensions(source: &str, target: Target) -> Result<CompilationResult, String> {
+    let config = CompilerConfig::default().with_target(target);
+    let mut compiler = EarthngCompiler::new(config);
+    compiler.compile(source)
 }

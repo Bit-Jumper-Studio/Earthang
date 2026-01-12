@@ -1,9 +1,9 @@
-// lib.rs - Main library module
 pub mod backend;
 pub mod compiler;
 pub mod disk_cache;
 pub mod dsl;
 pub mod emitter;
+pub mod extension;
 pub mod lua_frontend;
 pub mod lua_pool;
 pub mod rcl_compiler;
@@ -17,6 +17,7 @@ pub use compiler::{EarthngCompiler, CompilerConfig, compile, compile_with_hardwa
 pub use lua_frontend::{parse_program, LuaFrontend};
 pub use rcl_compiler::RclCompiler;
 pub use rcl_integration::EarthngCompilerWithRcl;
+pub use extension::{EarthngModule, AssemblyEmitter, BasicAssemblyEmitter, ExtensionRegistry, MathModule, StringModule, SystemModule};  // NEW
 
 // Type aliases for backward compatibility
 pub mod parser {
