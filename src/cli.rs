@@ -2,8 +2,7 @@ use clap::{Parser, Subcommand, Args, ValueEnum};
 use std::path::PathBuf;
 use colored::*;
 use std::time::Instant;
-use crate::compiler::{EarthngCompiler, CompilerConfig};
-use crate::rcl_integration::RclCli;
+use crate::compiler::{EarthangCompiler, CompilerConfig};
 use crate::backend::Backend;
 
 /// Terminal output styling
@@ -50,37 +49,34 @@ pub mod style {
     
     pub fn print_header(version: &str) {
         println!("{} {}", "Version:".dimmed(), version.cyan());
-        println!("{} {}\n", "Source:".dimmed(), "https://github.com/Bit-Jumper-Studio/Earthng".blue().underline());
+        println!("{} {}\n", "Source:".dimmed(), "https://github.com/Bit-Jumper-Studio/earthang".blue().underline());
     }
 }
 
-/// Earthng Compiler CLI
+/// earthang Compiler CLI
 #[derive(Parser)]
-#[command(name = "earthng")]
-#[command(about = "Earthng Compiler - Lua-like syntax to bare metal binary")]
+#[command(name = "earthang")]
+#[command(about = "earthang Compiler - Lua-like syntax to bare metal binary")]
 #[command(version = "1.0.0")]
 #[command(long_about = r#"
-Earthng Compiler - Lua-like syntax to bare metal binary
+earthang Compiler - Lua-like syntax to bare metal binary
 
 Compile Lua-like code to native binaries for BIOS, Linux, and Windows.
 
 Examples:
   Build a Linux ELF executable:
-    earthng compile program.lua --target linux64 --output program
+    earthang compile program.lua --target linux64 --output program
 
   Build a Windows executable:
-    earthng compile program.lua --target windows64 --output program.exe
+    earthang compile program.lua --target windows64 --output program.exe
 
   Build a BIOS boot sector:
-    earthng compile program.lua --target bios16 --output boot.bin
-
-  Create an RCL library:
-    earthng rcl-compile library.lua --target linux64 --output library.rcl
+    earthang compile program.lua --target bios16 --output boot.bin
 
   List available targets:
-    earthng targets
+    earthang targets
 
-For more information, see https://github.com/Bit-Jumper-Studio/Earthng
+For more information, see https://github.com/Bit-Jumper-Studio/earthang
 "#)]
 pub struct Cli {
     /// Enable verbose output
@@ -103,53 +99,17 @@ pub struct Cli {
 /// Available commands
 #[derive(Subcommand)]
 pub enum Commands {
-    /// Compile Earthng source to binary
+    /// Compile earthang source to binary
     Compile(CompileArgs),
-    
-    /// Create RCL library from Earthng source
-    #[command(name = "rcl-compile")]
-    RclCompile(RclCompileArgs),
-    
-    /// Show RCL library information
-    #[command(name = "rcl-info")]
-    RclInfo(RclInfoArgs),
-    
-    /// List functions in RCL library
-    #[command(name = "rcl-list")]
-    RclList(RclInfoArgs),
-    
-    /// Extract assembly from RCL library
-    #[command(name = "rcl-extract")]
-    RclExtract(RclExtractArgs),
-    
-    /// Test SSD syntax mutation
-    #[command(name = "ssd-test")]
-    SsdTest(SsdTestArgs),
-    
-    /// Create SSD components
-    #[command(name = "create-ssd")]
-    CreateSsd(CreateSsdArgs),
     
     /// Generate code
     Generate(GenerateArgs),
-    
-    /// Create RCL library (alias)
-    #[command(name = "create-rcl")]
-    CreateRcl(RclCompileArgs),
     
     /// Run tests
     Test(TestArgs),
     
     /// Show version
     Version,
-    
-    /// Generate modules
-    #[command(name = "generate-modules")]
-    GenerateModules,
-    
-    /// Compile modules
-    #[command(name = "compile-modules")]
-    CompileModules,
     
     /// Check toolchain
     Check,
@@ -206,25 +166,19 @@ impl CliTarget {
 #[command(after_help = r#"
 Examples:
   Build Linux ELF executable:
-    earthng compile program.lua --target linux64 --output program
+    earthang compile program.lua --target linux64 --output program
 
   Build Windows executable:
-    earthng compile program.lua --target windows64 --output program.exe
+    earthang compile program.lua --target windows64 --output program.exe
 
   Build BIOS boot sector:
-    earthng compile program.lua --target bios16 --output boot.bin
+    earthang compile program.lua --target bios16 --output boot.bin
 
   Build with SSE extensions:
-    earthng compile program.lua --target bios64sse --output kernel.bin
+    earthang compile program.lua --target bios64sse --output kernel.bin
 
   Build with optimization disabled:
-    earthng compile program.lua --target linux64 --no-optimize
-
-  Build with RCL libraries:
-    earthng compile program.lua --target linux64 --rcl --rcl-lib math.rcl
-
-  Build with SSD syntax extensions:
-    earthng compile program.lua --target bios64 --ssd --ssd-header syntax.json
+    earthang compile program.lua --target linux64 --no-optimize
 
 Notes:
   - Linux targets produce ELF executables
@@ -245,26 +199,6 @@ pub struct CompileArgs {
     #[arg(short, long, value_enum, default_value_t = CliTarget::Bios64)]
     pub target: CliTarget,
     
-    /// Enable SSD architecture
-    #[arg(long, help = "Enable SSD syntax extensions")]
-    pub ssd: bool,
-    
-    /// Load SSD header file (.json)
-    #[arg(long)]
-    pub ssd_header: Option<PathBuf>,
-    
-    /// Load SSD assembly file (.json)
-    #[arg(long)]
-    pub ssd_asm: Option<PathBuf>,
-    
-    /// Enable RCL library support
-    #[arg(long, help = "Enable RCL library linking")]
-    pub rcl: bool,
-    
-    /// Load RCL library (.rcl)
-    #[arg(long)]
-    pub rcl_lib: Vec<String>,
-    
     /// Keep assembly file
     #[arg(long, help = "Keep intermediate assembly file")]
     pub keep_assembly: bool,
@@ -273,101 +207,9 @@ pub struct CompileArgs {
     #[arg(long, help = "Disable code optimization")]
     pub no_optimize: bool,
     
-    /// Enable syntax mutation test
-    #[arg(long, help = "Test SSD syntax mutation")]
-    pub test_ssd: bool,
-    
     /// Show memory usage
     #[arg(long, help = "Show memory usage statistics")]
     pub memory: bool,
-}
-
-/// Arguments for RCL compile command
-#[derive(Args)]
-#[command(after_help = r#"
-Examples:
-  Create RCL library for Linux:
-    earthng rcl-compile math.lua --target linux64 --output math.rcl
-
-  Create RCL library for Windows:
-    earthng rcl-compile graphics.lua --target windows64 --output graphics.rcl
-
-  Create RCL library for BIOS:
-    earthng rcl-compile hardware.lua --target bios64 --output hardware.rcl
-
-Notes:
-  - RCL libraries are reusable code modules
-  - Each library is compiled for a specific target
-  - Libraries can be linked with --rcl-lib option
-"#)]
-pub struct RclCompileArgs {
-    /// Input Earthng source file
-    pub file: PathBuf,
-    
-    /// Output RCL library file
-    #[arg(short, long)]
-    pub output: Option<PathBuf>,
-    
-    /// Target platform
-    #[arg(short, long, value_enum, default_value_t = CliTarget::Bios64)]
-    pub target: CliTarget,
-    
-    /// Show detailed output
-    #[arg(long)]
-    pub detailed: bool,
-}
-
-/// Arguments for RCL info command
-#[derive(Args)]
-pub struct RclInfoArgs {
-    /// RCL library file
-    pub file: PathBuf,
-    
-    /// Show full information
-    #[arg(long)]
-    pub full: bool,
-}
-
-/// Arguments for RCL extract command
-#[derive(Args)]
-pub struct RclExtractArgs {
-    /// RCL library file
-    pub file: PathBuf,
-    
-    /// Function name to extract
-    pub function: String,
-    
-    /// Output file (default: stdout)
-    #[arg(short, long)]
-    pub output: Option<PathBuf>,
-}
-
-/// Arguments for SSD test command
-#[derive(Args)]
-pub struct SsdTestArgs {
-    /// Test file to use
-    #[arg(short, long)]
-    pub file: Option<PathBuf>,
-    
-    /// Show mutation details
-    #[arg(long)]
-    pub details: bool,
-}
-
-/// Arguments for create SSD command
-#[derive(Args)]
-pub struct CreateSsdArgs {
-    /// Create header file (.json)
-    #[arg(long)]
-    pub header: Option<PathBuf>,
-    
-    /// Create assembly file (.json)
-    #[arg(long)]
-    pub asm: Option<PathBuf>,
-    
-    /// Template type
-    #[arg(short, long, default_value = "basic")]
-    pub template: String,
 }
 
 /// Arguments for generate command
@@ -446,20 +288,11 @@ impl Cli {
         match &self.command {
             Some(command) => match command {
                 Commands::Compile(args) => self.handle_compile(args, self.verbose),
-                Commands::RclCompile(args) => self.handle_rcl_compile(args, self.verbose),
-                Commands::RclInfo(args) => self.handle_rcl_info(args, self.verbose),
-                Commands::RclList(args) => self.handle_rcl_list(args, self.verbose),
-                Commands::RclExtract(args) => self.handle_rcl_extract(args, self.verbose),
-                Commands::SsdTest(args) => self.handle_ssd_test(args, self.verbose),
-                Commands::CreateSsd(args) => self.handle_create_ssd(args, self.verbose),
-                Commands::Generate(args) => self.handle_generate(args, self.verbose),
-                Commands::CreateRcl(args) => self.handle_rcl_compile(args, self.verbose),
                 Commands::Test(args) => self.handle_test(args, self.verbose),
                 Commands::Version => self.handle_version(),
-                Commands::GenerateModules => self.handle_generate_modules(self.verbose),
-                Commands::CompileModules => self.handle_compile_modules(self.verbose),
                 Commands::Check => self.handle_check(self.verbose),
                 Commands::Targets => self.handle_targets(self.verbose),
+                Commands::Generate(args) => self.handle_generate(args, self.verbose),
             },
             None => {
                 if !self.quiet {
@@ -506,11 +339,6 @@ impl Cli {
             keep_assembly: args.keep_assembly,
             optimize: !args.no_optimize,
             modules: Vec::new(),
-            ssd_headers: args.ssd_header.iter().map(|p| p.to_string_lossy().to_string()).collect(),
-            ssd_assembly: args.ssd_asm.iter().map(|p| p.to_string_lossy().to_string()).collect(),
-            enable_ssd: args.ssd || args.test_ssd,
-            enable_rcl: args.rcl,
-            rcl_libraries: args.rcl_lib.clone(),
             debug_info: false,
             include_stdlib: false,
             hardware_dsl_enabled: false,
@@ -518,7 +346,7 @@ impl Cli {
         };
         
         progress.step("Compiling to assembly...");
-        let mut compiler = EarthngCompiler::new(config);
+        let mut compiler = EarthangCompiler::new(config);
         let result = compiler.compile(&source)?;
         
         progress.step("Writing output file...");
@@ -534,7 +362,6 @@ impl Cli {
                 CliTarget::Windows64 => "Windows executable",
                 CliTarget::Bios16 | CliTarget::Bios32 | CliTarget::Bios64 |
                 CliTarget::Bios64Sse | CliTarget::Bios64Avx | CliTarget::Bios64Avx512 => "BIOS binary",
-                _ => "binary",
             };
             
             println!("  {} {} {} created", "✓".green(), target_type, style::path(&output_file).bold());
@@ -547,214 +374,6 @@ impl Cli {
                 let asm_file = output_file.with_extension("asm");
                 println!("  {} {}", "Assembly saved to:".dimmed(), style::path(&asm_file));
             }
-        }
-        
-        Ok(())
-    }
-    
-    fn handle_rcl_compile(&self, args: &RclCompileArgs, verbose: bool) -> Result<(), String> {
-        let progress = Progress::new(verbose);
-        
-        if !self.quiet {
-            println!("{}", style::section("RCL LIBRARY COMPILATION"));
-            println!("  {} {}", "Source:".cyan(), style::path(&args.file));
-        }
-        
-        let input_file = &args.file;
-        let output_file = args.output.as_ref().map_or_else(|| {
-            let mut path = input_file.clone();
-            path.set_extension("rcl");
-            path
-        }, |p| p.clone());
-        
-        let target_str = match args.target {
-            CliTarget::Bios16 => "bios16",
-            CliTarget::Bios32 => "bios32",
-            CliTarget::Bios64 => "bios64",
-            CliTarget::Bios64Sse => "bios64_sse",
-            CliTarget::Bios64Avx => "bios64_avx",
-            CliTarget::Bios64Avx512 => "bios64_avx512",
-            CliTarget::Linux64 => "linux64",
-            CliTarget::Windows64 => "windows64",
-        };
-        
-        if !self.quiet {
-            println!("  {} {}", "Target:".cyan(), style::target(target_str));
-            println!("  {} {}", "Output:".cyan(), style::path(&output_file));
-        }
-        
-        progress.step("Creating RCL library...");
-        let cli = RclCli::new(verbose);
-        cli.compile_to_rcl(
-            &input_file.to_string_lossy(),
-            &output_file.to_string_lossy(),
-            target_str
-        )?;
-        
-        if !self.quiet {
-            progress.done("RCL library created successfully!");
-            println!();
-            println!("  {} {}", "Library saved to:".green(), style::path(&output_file).bold());
-            
-            // Show usage example
-            println!("\n  {} Use this library with:", style::info(""));
-            println!("    {} {}", ">".blue(), format!("earthng compile program.lua --target {} --rcl --rcl-lib {}", target_str, output_file.display()).cyan());
-        }
-        
-        Ok(())
-    }
-    
-    fn handle_rcl_info(&self, args: &RclInfoArgs, verbose: bool) -> Result<(), String> {
-        let progress = Progress::new(verbose);
-        
-        if !self.quiet {
-            println!("{}", style::section("RCL LIBRARY INFORMATION"));
-            println!("  {} {}", "Library:".cyan(), style::path(&args.file));
-        }
-        
-        progress.step("Reading RCL library...");
-        let cli = RclCli::new(verbose);
-        cli.show_rcl_info(&args.file.to_string_lossy())?;
-        
-        Ok(())
-    }
-    
-    fn handle_rcl_list(&self, args: &RclInfoArgs, verbose: bool) -> Result<(), String> {
-        let cli = RclCli::new(verbose);
-        cli.list_functions(&args.file.to_string_lossy())
-    }
-    
-    fn handle_rcl_extract(&self, args: &RclExtractArgs, verbose: bool) -> Result<(), String> {
-        let progress = Progress::new(verbose);
-        
-        if !self.quiet {
-            println!("{}", style::section("RCL FUNCTION EXTRACTION"));
-            println!("  {} {}", "Library:".cyan(), style::path(&args.file));
-            println!("  {} {}", "Function:".cyan(), args.function.blue());
-        }
-        
-        progress.step("Extracting function assembly...");
-        let cli = RclCli::new(verbose);
-        cli.extract_assembly(&args.file.to_string_lossy(), &args.function)?;
-        
-        Ok(())
-    }
-    
-    fn handle_ssd_test(&self, args: &SsdTestArgs, verbose: bool) -> Result<(), String> {
-        let progress = Progress::new(verbose);
-        
-        if !self.quiet {
-            println!("{}", style::section("SSD SYNTAX MUTATION TEST"));
-        }
-        
-        let source = if let Some(file) = &args.file {
-            progress.step(&format!("Reading test file: {}", file.display()));
-            std::fs::read_to_string(file)
-                .map_err(|e| progress.error(&format!("Failed to read file: {}", e)))?
-        } else {
-            // Lua-like syntax example
-            r#"
--- Lua-like Earthng syntax
-function greet(name)
-    print("Hello, " .. name .. "!")
-    return "Greeted " .. name
-end
-
-x = 10
-y = 20
-z = x + y
-
-result = greet("World")
-print("Result: " .. result)
-print("Sum: " .. tostring(z))
-"#.to_string()
-        };
-        
-        if !self.quiet {
-            println!("\n  {} {}", "Original source:".cyan(), "(Lua-like syntax)".yellow());
-            println!("{}", "  ──────────────────────────".dimmed());
-            println!("{}", source.lines().map(|l| format!("  │ {}", l)).collect::<Vec<_>>().join("\n"));
-            println!("{}", "  ──────────────────────────".dimmed());
-            
-            let mutated = source
-                .replace("function ", "fn ")
-                .replace("print(", "io.write(")
-                .replace("tostring(", "str(");
-            
-            println!("\n  {} {}", "Compiled to:".cyan(), "(Earthng internal)".green());
-            println!("{}", "  ──────────────────────────".dimmed());
-            println!("{}", mutated.lines().map(|l| format!("  │ {}", l)).collect::<Vec<_>>().join("\n"));
-            println!("{}", "  ──────────────────────────".dimmed());
-            
-            if args.details {
-                println!("\n  {} Mutations applied:", style::info(""));
-                println!("    {} {}", ">".blue(), "function → fn".dimmed());
-                println!("    {} {}", ">".blue(), "print → io.write".dimmed());
-                println!("    {} {}", ">".blue(), "tostring → str".dimmed());
-                println!("    {} {}", ">".blue(), ".. → + (string concatenation)".dimmed());
-            }
-            
-            progress.done("SSD syntax mutation test completed!");
-        }
-        
-        Ok(())
-    }
-    
-    fn handle_create_ssd(&self, args: &CreateSsdArgs, verbose: bool) -> Result<(), String> {
-        let progress = Progress::new(verbose);
-        
-        if !self.quiet {
-            println!("{}", style::section("CREATE SSD COMPONENTS"));
-        }
-        
-        use crate::ssd_injector;
-        
-        let mut created_anything = false;
-        
-        if let Some(ref header_path) = args.header {
-            progress.step(&format!("Creating SSD header: {}", header_path.display()));
-            
-            let header = match args.template.as_str() {
-                "basic" => ssd_injector::SsdInjector::create_test_syntax_mutation(),
-                "lua" => ssd_injector::SsdInjector::create_test_syntax_mutation(), // Fixed: use test syntax mutation
-                _ => ssd_injector::SsdInjector::create_test_syntax_mutation(),
-            };
-            
-            let json = serde_json::to_string_pretty(&header)
-                .map_err(|e| progress.error(&format!("Failed to serialize SSD header: {}", e)))?;
-            
-            std::fs::write(header_path, &json)
-                .map_err(|e| progress.error(&format!("Failed to write SSD header: {}", e)))?;
-            
-            if !self.quiet {
-                println!("    {} {}", "✓".green(), format!("Header created: {}", header_path.display()).dimmed());
-            }
-            created_anything = true;
-        }
-        
-        if let Some(ref asm_path) = args.asm {
-            progress.step(&format!("Creating SSD assembly: {}", asm_path.display()));
-            
-            let asm_block = ssd_injector::SsdInjector::create_test_negative_number_handling();
-            let json = serde_json::to_string_pretty(&asm_block)
-                .map_err(|e| progress.error(&format!("Failed to serialize SSD assembly: {}", e)))?;
-            
-            std::fs::write(asm_path, &json)
-                .map_err(|e| progress.error(&format!("Failed to write SSD assembly: {}", e)))?;
-            
-            if !self.quiet {
-                println!("    {} {}", "✓".green(), format!("Assembly created: {}", asm_path.display()).dimmed());
-            }
-            created_anything = true;
-        }
-        
-        if !created_anything {
-            progress.warn("No components specified. Use --header or --asm options.");
-            println!("\n  {} Available templates:", style::info(""));
-            println!("    {} {} - Basic syntax mutations", ">".blue(), "basic".green());
-            println!("    {} {} - Lua syntax features", ">".blue(), "lua".green());
-        } else if !self.quiet {
-            progress.done("SSD components created successfully!");
         }
         
         Ok(())
@@ -775,7 +394,7 @@ print("Sum: " .. tostring(z))
                 progress.step("Generating 16-bit boot sector...");
                 format!(
                     "; 16-bit Boot Sector ({} bytes)\n\
-                     ; Generated by Earthng Compiler\n\
+                     ; Generated by earthang Compiler\n\
                      \n\
                      bits 16\n\
                      org 0x7C00\n\n\
@@ -807,7 +426,7 @@ print("Sum: " .. tostring(z))
                          popa\n\
                          ret\n\n\
                      msg:\n\
-                         db 'Earthng 16-bit', 0\n\n\
+                         db 'earthang 16-bit', 0\n\n\
                      times {} db 0\n\
                      dw 0xAA55\n",
                     args.size,
@@ -818,7 +437,7 @@ print("Sum: " .. tostring(z))
                 progress.step("Generating 64-bit Linux ELF executable...");
                 format!(
                     "; Linux 64-bit ELF Executable\n\
-                     ; Generated by Earthng Compiler\n\
+                     ; Generated by earthang Compiler\n\
                      \n\
                      bits 64\n\
                      default rel\n\n\
@@ -840,14 +459,14 @@ print("Sum: " .. tostring(z))
                          syscall\n\n\
                      section .data\n\
                      msg:\n\
-                         db 'Hello Earthng!', 10, 0\n"
+                         db 'Hello earthang!', 10, 0\n"
                 )
             }
             crate::backend::Target::Windows64 => {
                 progress.step("Generating 64-bit Windows PE executable...");
                 format!(
                     "; Windows 64-bit PE Executable\n\
-                     ; Generated by Earthng Compiler\n\
+                     ; Generated by earthang Compiler\n\
                      \n\
                      bits 64\n\
                      default rel\n\n\
@@ -867,7 +486,7 @@ print("Sum: " .. tostring(z))
                          call ExitProcess\n\n\
                      section .data\n\
                      msg:\n\
-                         db 'Hello Earthng!', 0\n\
+                         db 'Hello earthang!', 0\n\
                      fmt:\n\
                          db '%s', 10, 0\n"
                 )
@@ -1074,58 +693,6 @@ print("Factorial of 5 is: " .. tostring(result))
         Ok(())
     }
     
-    fn handle_generate_modules(&self, verbose: bool) -> Result<(), String> {
-        let progress = Progress::new(verbose);
-        
-        if !self.quiet {
-            println!("{}", style::section("AVAILABLE MODULES"));
-        }
-        
-        progress.step("Loading module definitions...");
-        
-        println!("\n  {} Core Modules:", style::info(""));
-        println!("    {} {} - Standard library functions", ">".blue(), "std".green().bold());
-        println!("    {} {} - Mathematical operations", ">".blue(), "math".green().bold());
-        println!("    {} {} - String manipulation", ">".blue(), "string".green().bold());
-        println!("    {} {} - Input/output operations", ">".blue(), "io".green().bold());
-        println!("    {} {} - Table operations", ">".blue(), "table".green().bold());
-        
-        println!("\n  {} Hardware Modules:", style::info(""));
-        println!("    {} {} - BIOS interrupt calls", ">".blue(), "bios".green().bold());
-        println!("    {} {} - Hardware port I/O", ">".blue(), "ports".green().bold());
-        println!("    {} {} - DMA operations", ">".blue(), "dma".green().bold());
-        
-        println!("\n  {} Lua Compatibility:", style::info(""));
-        println!("    {} {} - Standard Lua functions", ">".blue(), "lua".green().bold());
-        println!("    {} {} - Coroutine support", ">".blue(), "coroutine".green().bold());
-        println!("    {} {} - Package management", ">".blue(), "package".green().bold());
-        
-        println!("\n  {} Usage:", style::info(""));
-        println!("    {} Import a module: {}", ">".blue(), "require \"std\"".cyan());
-        println!("    {} Use a function: {}", ">".blue(), "io.write(\"Hello\")".cyan());
-        
-        progress.done("Module information displayed");
-        
-        Ok(())
-    }
-    
-    fn handle_compile_modules(&self, verbose: bool) -> Result<(), String> {
-        let progress = Progress::new(verbose);
-        
-        if !self.quiet {
-            println!("{}", style::section("MODULE COMPILATION"));
-        }
-        
-        progress.warn("Module compilation is not yet implemented");
-        println!("\n  {} Planned features:", style::info(""));
-        println!("    {} Compile modules to RCL libraries", ">".blue());
-        println!("    {} Automatic dependency resolution", ">".blue());
-        println!("    {} Cross-module optimization", ">".blue());
-        println!("    {} Lua module compatibility", ">".blue());
-        
-        Ok(())
-    }
-    
     fn handle_check(&self, verbose: bool) -> Result<(), String> {
         let progress = Progress::new(verbose);
         
@@ -1221,9 +788,9 @@ print("Factorial of 5 is: " .. tostring(result))
         );
         
         println!("\n  {} Build Commands:", style::info(""));
-        println!("    {} Build Linux ELF: {}", ">".blue(), "earthng compile program.lua --target linux64 --output program".cyan());
-        println!("    {} Build Windows PE: {}", ">".blue(), "earthng compile program.lua --target windows64 --output program.exe".cyan());
-        println!("    {} Build BIOS: {}", ">".blue(), "earthng compile program.lua --target bios64 --output kernel.bin".cyan());
+        println!("    {} Build Linux ELF: {}", ">".blue(), "earthang compile program.lua --target linux64 --output program".cyan());
+        println!("    {} Build Windows PE: {}", ">".blue(), "earthang compile program.lua --target windows64 --output program.exe".cyan());
+        println!("    {} Build BIOS: {}", ">".blue(), "earthang compile program.lua --target bios64 --output kernel.bin".cyan());
         
         println!("\n  {} Output Formats:", style::info(""));
         println!("    {} {} - Executable and Linkable Format (Linux)", "•".blue(), "ELF".green());

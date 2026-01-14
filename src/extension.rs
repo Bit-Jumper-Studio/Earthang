@@ -2,7 +2,7 @@ use std::collections::HashMap;
 use crate::backend::{Target, Capability};
 use crate::parser::Expr;
 
-/// Trait for Earthng language extension modules
+/// Trait for earthang language extension modules
 pub trait EarthngModule {
     /// Name of the module
     fn name(&self) -> &str;
@@ -165,9 +165,7 @@ impl ExtensionRegistry {
     }
 }
 
-// ========== BUILT-IN MODULES ==========
-
-/// Math module for Earthng
+/// Math module for earthang
 pub struct MathModule {
     name: String,
     description: String,
@@ -211,13 +209,13 @@ impl EarthngModule for MathModule {
         &self,
         func: &str,
         args: &[Expr],
-        target: &Target,
+        _target: &Target,
         emitter: &mut dyn AssemblyEmitter
     ) -> Result<String, String> {
         let mut asm = emitter.emit_comment(&format!("Math.{} call", func));
         
         // Convert arguments to string representation
-        let arg_strings: Vec<String> = args.iter()
+        let _arg_strings: Vec<String> = args.iter()
             .map(|arg| match arg {
                 Expr::Number(n, _) => n.to_string(),
                 Expr::Var(name, _) => name.clone(),
@@ -251,7 +249,7 @@ impl EarthngModule for MathModule {
     }
 }
 
-/// String module for Earthng
+/// String module for earthang
 pub struct StringModule {
     name: String,
     description: String,
@@ -293,8 +291,8 @@ impl EarthngModule for StringModule {
     fn compile_function(
         &self,
         func: &str,
-        args: &[Expr],
-        target: &Target,
+        _args: &[Expr],
+        _target: &Target,
         emitter: &mut dyn AssemblyEmitter
     ) -> Result<String, String> {
         let mut asm = emitter.emit_comment(&format!("String.{} call", func));
@@ -324,7 +322,7 @@ impl EarthngModule for StringModule {
     }
 }
 
-/// System module for Earthng
+/// System module for earthang
 pub struct SystemModule {
     name: String,
     description: String,
@@ -363,7 +361,7 @@ impl EarthngModule for SystemModule {
     fn compile_function(
         &self,
         func: &str,
-        args: &[Expr],
+        _args: &[Expr],
         target: &Target,
         emitter: &mut dyn AssemblyEmitter
     ) -> Result<String, String> {

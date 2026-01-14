@@ -210,7 +210,6 @@ impl NasmEmitter {
         }
     }
     
-    // WINDOWS 64-BIT COMPILATION
     fn compile_windows64(&mut self, program: &Program) -> Result<String, String> {
         let var_count = self.count_variables(program);
         let stack_space = 32 + (var_count * 8); // Shadow space + variables
@@ -323,7 +322,6 @@ impl NasmEmitter {
         Ok(code)
     }
     
-    // LINUX 64-BIT COMPILATION
     fn compile_linux64(&mut self, program: &Program) -> Result<String, String> {
     let mut code = String::new();
     
@@ -354,7 +352,6 @@ impl NasmEmitter {
     // Compile program statements
     self.compile_linux64_statements(&mut code, &program.body)?;
     
-    // FIXED: Proper function return
     code.push_str("    ; Return from main\n");
     code.push_str("    mov rsp, rbp\n");
     code.push_str("    pop rbp\n");
@@ -566,8 +563,6 @@ impl NasmEmitter {
                         // Compile the argument first
                         self.compile_windows64_expression(code, arg)?;
                         
-                        // Now rax contains the value to print
-                        // For strings, use printf format
                         if matches!(arg, Expr::String(_, _) | Expr::Var(_, _)) {
                             // String or variable (could be string)
                             code.push_str("    mov rdx, rax          ; Second arg: string address\n");
@@ -680,7 +675,6 @@ impl NasmEmitter {
                     code.push_str("    ; var ");
                     code.push_str(name);
                     code.push_str(" = \n");
-                    // For Linux, we'd need to implement variable storage
                 }
                 _ => {
                     code.push_str("    ; [Statement]\n");
@@ -696,7 +690,7 @@ impl NasmEmitter {
         match self.target.platform {
             TargetPlatform::Bios16 => self.compile_bios16(&mut code, program)?,
             TargetPlatform::Bios32 => self.compile_bios32(&mut code, program)?,
-            TargetPlatform::Bios64 => self.compile_bios64_fixed(&mut code, program)?,
+            TargetPlatform::Bios64 => self.compile_bios64(&mut code, program)?,
             TargetPlatform::Bios64SSE => self.compile_bios64_sse(&mut code, program)?,
             TargetPlatform::Bios64AVX => self.compile_bios64_avx(&mut code, program)?,
             TargetPlatform::Bios64AVX512 => self.compile_bios64_avx512(&mut code, program)?,
@@ -736,7 +730,6 @@ impl NasmEmitter {
         
         self.compile_bios16_statements(code, &program.body);
         
-        // CRITICAL: Add infinite loop BEFORE any data
         code.push_str("\n    cli\n");
         code.push_str("    hlt\n");
         code.push_str("    jmp $\n\n");
@@ -833,7 +826,6 @@ impl NasmEmitter {
         
         self.compile_bios32_statements(code, &program.body);
         
-        // CRITICAL: Add infinite loop BEFORE any data
         code.push_str("\n    cli\n");
         code.push_str("    hlt\n");
         code.push_str("    jmp $\n\n");
@@ -902,8 +894,7 @@ impl NasmEmitter {
         Ok(())
     }
     
-    // FIXED 64-bit bootloader - with corrected instructions and proper code/data separation
-    fn compile_bios64_fixed(&mut self, code: &mut String, program: &Program) -> Result<(), String> {
+    fn compile_bios64(&mut self, code: &mut String, program: &Program) -> Result<(), String> {
         code.push_str("; Rython 64-bit Bootloader - Fixed Version\n\n");
         code.push_str("    org 0x7C00\n");
         code.push_str("    bits 16\n\n");
@@ -934,8 +925,7 @@ impl NasmEmitter {
         code.push_str("    or eax, 1\n");
         code.push_str("    mov cr0, eax\n\n");
         code.push_str("    jmp 0x08:protected_mode\n\n");
-        
-        // ========== 32-bit code ==========
+
         code.push_str("    bits 32\n");
         code.push_str("protected_mode:\n");
         code.push_str("    mov ax, 0x10\n");
@@ -994,7 +984,6 @@ impl NasmEmitter {
         // Jump to 64-bit mode
         code.push_str("    jmp 0x08:long_mode\n\n");
         
-        // ========== 64-bit code ==========
         code.push_str("    bits 64\n");
         code.push_str("long_mode:\n");
         
@@ -1020,12 +1009,10 @@ impl NasmEmitter {
         // Compile program
         self.compile_bios64_statements(code, &program.body)?;
         
-        // CRITICAL: End code with infinite loop BEFORE any data
         code.push_str("\n    cli\n");
         code.push_str("    hlt\n");
         code.push_str("    jmp $\n\n");
         
-        // ========== 64-bit subroutines ==========
         code.push_str("print_string_64:\n");
         code.push_str("    push rdi\n");
         code.push_str(".loop:\n");
@@ -1073,7 +1060,6 @@ impl NasmEmitter {
         code.push_str("    pop rdi\n");
         code.push_str("    ret\n\n");
         
-        // ========== GDTs ==========
         code.push_str("gdt32:\n");
         code.push_str("    dq 0x0000000000000000\n");
         code.push_str("    dq 0x00CF9A000000FFFF\n");
@@ -1098,7 +1084,6 @@ impl NasmEmitter {
         code.push_str("    times 510-($-$$) db 0\n");
         code.push_str("    dw 0xAA55\n\n");
         
-        // ========== DATA SECTION (starts at 0x7E00) ==========
         code.push_str("    ; String data at 0x7E00 (after boot sector)\n");
         code.push_str("    times 512 db 0  ; Boot sector padding\n");
         code.push_str("    db 'Rython 64-bit', 0\n");
@@ -1108,19 +1093,19 @@ impl NasmEmitter {
     
     // Other BIOS variants
     fn compile_bios64_sse(&mut self, code: &mut String, program: &Program) -> Result<(), String> {
-        self.compile_bios64_fixed(code, program)?;
+        self.compile_bios64(code, program)?;
         code.push_str("\n    ; SSE enabled\n");
         Ok(())
     }
     
     fn compile_bios64_avx(&mut self, code: &mut String, program: &Program) -> Result<(), String> {
-        self.compile_bios64_fixed(code, program)?;
+        self.compile_bios64(code, program)?;
         code.push_str("\n    ; AVX enabled\n");
         Ok(())
     }
     
     fn compile_bios64_avx512(&mut self, code: &mut String, program: &Program) -> Result<(), String> {
-        self.compile_bios64_fixed(code, program)?;
+        self.compile_bios64(code, program)?;
         code.push_str("\n    ; AVX-512 enabled\n");
         Ok(())
     }

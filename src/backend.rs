@@ -61,10 +61,6 @@ pub struct BackendModule {
     #[allow(dead_code)]
     pub globals: Vec<BackendGlobal>,
     pub required_capabilities: Vec<Capability>,
-    #[allow(dead_code)]
-    pub external_asm: Vec<String>, // SSD: External assembly to inject
-    #[allow(dead_code)]
-    pub syntax_extensions: Vec<SyntaxExtension>, // SSD: Syntax extensions from RCL
 }
 
 #[derive(Debug, Clone)]
@@ -84,18 +80,6 @@ pub struct BackendGlobal {
     pub type_name: String,
 }
 
-// SSD: Syntax extension from RCL header
-#[derive(Debug, Clone)]
-pub struct SyntaxExtension {
-    #[allow(dead_code)]
-    pub pattern: String,       // e.g., "> expr" 
-    #[allow(dead_code)]
-    pub replacement: String,   // e.g., "print(expr)"
-    pub assembly_label: Option<String>, // Associated assembly function
-    #[allow(dead_code)]
-    pub register_args: Vec<String>, // Which registers to use for arguments
-}
-
 // Struct to track variables
 #[derive(Debug, Clone)]
 pub struct VariableInfo {
@@ -109,29 +93,29 @@ pub struct VariableInfo {
 // Struct for function context
 #[derive(Debug, Clone)]
 struct FunctionContext {
+    #[allow(dead_code)]
     name: String,
+    #[allow(dead_code)]
     args: Vec<String>,
     locals: HashMap<String, VariableInfo>,
-    return_label: String,
     has_returned: bool,
     stack_size: i32,
 }
 
 impl FunctionContext {
     fn new(name: String, args: Vec<String>) -> Self {
-        let return_label = format!("{}_return", name.clone()); // FIXED: Clone name
+        let _return_label = format!("{}_return", name.clone());
         Self {
             name,
             args,
             locals: HashMap::new(),
-            return_label,
             has_returned: false,
             stack_size: 0,
         }
     }
     
     fn add_local(&mut self, name: String, offset: i32, type_hint: Option<String>) {
-        let var_name = name.clone(); // FIXED: Clone name before moving
+        let var_name = name.clone();
         self.locals.insert(name, VariableInfo {
             name: var_name,
             offset,
@@ -149,7 +133,7 @@ impl FunctionContext {
     }
 }
 
-/// Trait for Earthng language extension modules
+/// Trait for earthang language extension modules
 pub trait EarthngModule {
     /// Name of the module
     fn name(&self) -> &str;
@@ -311,8 +295,6 @@ impl ExtensionRegistry {
     pub fn load_module(&mut self, name: &str) -> Result<(), String> {
         for module in &self.modules {
             if module.name() == name {
-                // Note: We can't clone a Box<dyn EarthngModule> easily
-                // This is a placeholder - in real implementation we'd need CloneBox trait
                 return Err("Module cloning not implemented".to_string());
             }
         }
@@ -364,53 +346,6 @@ pub trait Backend {
     /// Generate instruction from expression
     fn compile_expression(&mut self, expr: &Expr) -> Result<String, String>;
     
-    /// SSD: Inject external assembly into generated code
-    fn inject_external_asm(&self, base_asm: &str, external_asm: &[String]) -> String {
-        let mut final_asm = base_asm.to_string();
-        
-        for asm_block in external_asm {
-            final_asm.push_str("\n; === SSD Injected Assembly ===\n");
-            final_asm.push_str(asm_block);
-            final_asm.push_str("\n; === End SSD Injected Assembly ===\n");
-        }
-        
-        final_asm
-    }
-    
-    /// SSD: Apply syntax extensions to program
-    #[allow(dead_code)]
-    fn apply_syntax_extensions(&self, _program: &mut Program, _extensions: &[SyntaxExtension]) -> Result<(), String> {
-        for ext in _extensions {
-            // This would be implemented in parser.rs, but we declare the interface here
-            println!("Applying syntax extension: {} -> {}", ext.pattern, ext.replacement);
-        }
-        Ok(())
-    }
-    
-    /// SSD: Prepare register arguments for FFI
-    #[allow(dead_code)]
-    fn prepare_register_args(&self, args: &[Expr], registers: &[String]) -> String {
-        let mut asm = String::new();
-        
-        for (i, (arg, reg)) in args.iter().zip(registers.iter()).enumerate() {
-            match arg {
-                Expr::Number(n, _) => {
-                    asm.push_str(&format!("    mov {}, {}\n", reg, n));
-                }
-                Expr::Var(name, _) => {
-                    asm.push_str(&format!("    ; Loading variable {} into {}\n", name, reg));
-                    // Variable loading would be implemented per-backend
-                }
-                _ => {}
-            }
-            
-            // Stop if we run out of registers
-            if i >= 3 { break; } // RCX, RDX, R8, R9 on Windows64
-        }
-        
-        asm
-    }
-    
     /// For downcasting
     fn as_any(&self) -> &dyn Any;
     fn as_any_mut(&mut self) -> &mut dyn Any;
@@ -461,23 +396,15 @@ impl BackendRegistry {
     }
 }
 
-
 pub struct Bios16Backend {
     string_literals: HashMap<String, String>,
-    external_asm: Vec<String>, // SSD: Store external assembly
 }
 
 impl Bios16Backend {
     pub fn new() -> Self {
         Self {
             string_literals: HashMap::new(),
-            external_asm: Vec::new(),
         }
-    }
-    
-    #[allow(dead_code)]
-    pub fn add_external_asm(&mut self, asm: &str) {
-        self.external_asm.push(asm.to_string());
     }
     
     fn generate_string_data(&self) -> String {
@@ -594,9 +521,6 @@ impl Backend for Bios16Backend {
         asm.push_str("; String literals\n");
         asm.push_str(&self.generate_string_data());
         
-        // SSD: Inject external assembly
-        asm = self.inject_external_asm(&asm, &self.external_asm);
-        
         asm.push_str("\n    times 510-($-$$) db 0\n");
         asm.push_str("    dw 0xAA55\n");
         
@@ -640,23 +564,15 @@ impl Backend for Bios16Backend {
     }
 }
 
-
 pub struct Bios32Backend {
     string_literals: HashMap<String, String>,
-    external_asm: Vec<String>, // SSD: Store external assembly
 }
 
 impl Bios32Backend {
     pub fn new() -> Self {
         Self {
             string_literals: HashMap::new(),
-            external_asm: Vec::new(),
         }
-    }
-    
-    #[allow(dead_code)]
-    pub fn add_external_asm(&mut self, asm: &str) {
-        self.external_asm.push(asm.to_string());
     }
     
     fn generate_string_data(&self) -> String {
@@ -800,9 +716,6 @@ impl Backend for Bios32Backend {
         asm.push_str("; String literals\n");
         asm.push_str(&self.generate_string_data());
         
-        // SSD: Inject external assembly
-        asm = self.inject_external_asm(&asm, &self.external_asm);
-        
         // GDT
         asm.push_str("gdt32:\n");
         asm.push_str("    dq 0x0000000000000000\n");
@@ -859,7 +772,6 @@ impl Backend for Bios32Backend {
     }
 }
 
-
 pub struct Bios64Backend {
     use_sse: bool,
     use_avx: bool,
@@ -868,9 +780,7 @@ pub struct Bios64Backend {
     string_literals: RefCell<HashMap<String, String>>,
     #[allow(dead_code)]
     code_size_limit: usize,
-    external_asm: Vec<String>, // SSD: Store external assembly
-    syntax_extensions: Vec<SyntaxExtension>, // SSD: Syntax extensions
-    hardware_dsl: HardwareDSL, // NEW: Hardware DSL for device code generation
+    hardware_dsl: HardwareDSL, // Hardware DSL for device code generation
     label_counter: RefCell<u32>, // For generating unique labels
 }
 
@@ -883,9 +793,7 @@ impl Bios64Backend {
             string_counter: RefCell::new(0),
             string_literals: RefCell::new(HashMap::new()),
             code_size_limit: 4096,  // 4KB max for kernel
-            external_asm: Vec::new(),
-            syntax_extensions: Vec::new(),
-            hardware_dsl: HardwareDSL::new(), // NEW: Initialize hardware DSL
+            hardware_dsl: HardwareDSL::new(), // Initialize hardware DSL
             label_counter: RefCell::new(0),
         }
     }
@@ -907,23 +815,6 @@ impl Bios64Backend {
         } else {
             Ok(())
         }
-    }
-    
-    // SSD: Add external assembly
-    #[allow(dead_code)]
-    pub fn add_external_asm(&mut self, asm: &str) {
-        self.external_asm.push(asm.to_string());
-    }
-    
-    // SSD: Add syntax extension
-    #[allow(dead_code)]
-    pub fn add_syntax_extension(&mut self, pattern: &str, replacement: &str, assembly_label: Option<&str>, register_args: Vec<String>) {
-        self.syntax_extensions.push(SyntaxExtension {
-            pattern: pattern.to_string(),
-            replacement: replacement.to_string(),
-            assembly_label: assembly_label.map(|s| s.to_string()),
-            register_args,
-        });
     }
     
     pub fn with_sse(mut self) -> Self {
@@ -964,7 +855,7 @@ impl Bios64Backend {
         data
     }
     
-    // NEW: Method to compile hardware function definitions
+    // Method to compile hardware function definitions
     fn compile_hardware_function_def(&self, device: &str, name: &str, args: &[String], body: &[Statement]) -> Result<String, String> {
         let mut asm = String::new();
         
@@ -1009,7 +900,6 @@ impl Bios64Backend {
         // Compile the body of the hardware function
         asm.push_str("    ; Hardware function body\n");
         for stmt in body {
-            // For now, just add a comment - we'll implement proper compilation later
             asm.push_str(&format!("    ; Statement: {:?}\n", stmt));
         }
         
@@ -1053,7 +943,6 @@ impl Bios64Backend {
                 Ok(())
             }
             Expr::Var(name, _) => {
-                // BIOS64 doesn't have proper variable tracking yet
                 code.push_str(&format!("    ; Variable: {} (not implemented in BIOS64)\n", name));
                 // Return a dummy value
                 code.push_str("    mov rax, 0\n");
@@ -1302,7 +1191,7 @@ impl Bios64Backend {
                     // Additional args on stack
                     let offset = 16 + (i - 4) * 8;
                     asm.push_str(&format!("    ; {} -> [rbp + {}]\n", arg, offset));
-                    let offset_i32 = offset as i32; // FIXED: Convert to i32 first
+                    let offset_i32 = offset as i32; // Convert to i32 first
                     func_ctx.add_local(arg.clone(), -offset_i32, None); // Now negate
                 }
             }
@@ -1854,14 +1743,6 @@ impl Backend for Bios64Backend {
             }
         }
         
-        // SSD: Handle syntax extensions that need assembly calls
-        for ext in &self.syntax_extensions {
-            if let Some(label) = &ext.assembly_label {
-                asm.push_str(&format!("    ; Syntax extension assembly call: {}\n", label));
-                asm.push_str(&format!("    call {}\n", label));
-            }
-        }
-        
         asm.push_str("\n    cli\n");
         asm.push_str("    hlt\n");
         asm.push_str("    jmp $\n\n");
@@ -1942,9 +1823,6 @@ impl Backend for Bios64Backend {
         asm.push_str("; String literals\n");
         asm.push_str(&self.generate_string_data());
         
-        // SSD: Inject external assembly
-        asm = self.inject_external_asm(&asm, &self.external_asm);
-        
         asm.push_str("    times 510-($-$$) db 0\n");
         asm.push_str("    dw 0xAA55\n");
         
@@ -1994,7 +1872,6 @@ pub struct Linux64Backend {
     string_literals: RefCell<HashMap<String, String>>,
     symbol_table: RefCell<HashMap<String, VariableInfo>>,
     current_stack_offset: RefCell<i32>,
-    external_asm: Vec<String>, // SSD: Store external assembly
     label_counter: RefCell<u32>, // For generating unique labels
 }
 
@@ -2005,11 +1882,11 @@ impl Linux64Backend {
             string_literals: RefCell::new(HashMap::new()),
             symbol_table: RefCell::new(HashMap::new()),
             current_stack_offset: RefCell::new(0),
-            external_asm: Vec::new(),
             label_counter: RefCell::new(0),
         }
     }
 
+    #[allow(dead_code)]
     fn compile_binary_op(&self, left: &Expr, op: &Op, right: &Expr) -> Result<String, String> {
     let mut code = String::new();
     
@@ -2028,8 +1905,6 @@ impl Linux64Backend {
             }
         }
         _ => {
-            // For other expression types, we need to compile them
-            // For now, return an error
             return Err("Unsupported left operand type in binary operation".to_string());
         }
     }
@@ -2078,11 +1953,6 @@ impl Linux64Backend {
     Ok(code)
 }
     
-    #[allow(dead_code)]
-    pub fn add_external_asm(&mut self, asm: &str) {
-        self.external_asm.push(asm.to_string());
-    }
-    
     fn allocate_variable_sp_relative(&self, name: &str) -> i32 {
         let mut offset = self.current_stack_offset.borrow_mut();
         
@@ -2107,6 +1977,7 @@ impl Linux64Backend {
         self.symbol_table.borrow().get(name).map(|v| v.offset)
     }
     
+    #[allow(dead_code)]
     fn ensure_variable_exists_sp_relative(&self, name: &str) -> i32 {
         if let Some(offset) = self.get_variable_offset_sp_relative(name) {
             offset
@@ -2133,7 +2004,6 @@ impl Linux64Backend {
         let mut data = String::new();
         for (content, label) in &*literals {
             data.push_str(&format!("{}:\n", label));
-            // NO NEWLINE in the string data! Just null terminator
             data.push_str(&format!("    db '{}', 0\n", content.replace("'", "''")));
         }
         data
@@ -2493,9 +2363,6 @@ impl Backend for Linux64Backend {
     asm.push_str("; String literals\n");
     asm.push_str(&self.generate_string_data());
     
-    // SSD: Inject external assembly
-    asm = self.inject_external_asm(&asm, &self.external_asm);
-    
     Ok(asm)
 }
     
@@ -2682,15 +2549,11 @@ impl Backend for Linux64Backend {
     }
 }
 
-
 pub struct Windows64Backend {
     string_counter: RefCell<u32>,
     string_literals: RefCell<HashMap<String, String>>,
     symbol_table: RefCell<HashMap<String, VariableInfo>>,
     current_stack_offset: RefCell<i32>,
-    external_asm: Vec<String>, // SSD: Store external assembly
-    #[allow(dead_code)]
-    syntax_extensions: Vec<SyntaxExtension>, // SSD: Syntax extensions
 }
 
 impl Windows64Backend {
@@ -2700,14 +2563,7 @@ impl Windows64Backend {
             string_literals: RefCell::new(HashMap::new()),
             symbol_table: RefCell::new(HashMap::new()),
             current_stack_offset: RefCell::new(8), // Start at rbp-8
-            external_asm: Vec::new(),
-            syntax_extensions: Vec::new(),
         }
-    }
-    
-    #[allow(dead_code)]
-    pub fn add_external_asm(&mut self, asm: &str) {
-        self.external_asm.push(asm.to_string());
     }
     
     fn allocate_variable(&self, name: &str) -> i32 {
@@ -2786,45 +2642,6 @@ impl Windows64Backend {
     }
     count
 }
-    
-    // SSD: Handle FFI register passing for external assembly
-    #[allow(dead_code)]
-    fn handle_ffi_call(&self, func_label: &str, args: &[Expr], registers: &[String]) -> Result<String, String> {
-        let mut asm = String::new();
-        
-        asm.push_str(&format!("    ; FFI call to {}\n", func_label));
-        
-        // Prepare arguments in registers
-        for (i, (arg, reg)) in args.iter().zip(registers.iter()).enumerate() {
-            match arg {
-                Expr::Number(n, _) => {
-                    asm.push_str(&format!("    mov {}, {}\n", reg, n));
-                }
-                Expr::Var(name, _) => {
-                    if let Some(offset) = self.get_variable_offset(name) {
-                        asm.push_str(&format!("    mov {}, [rbp - {}]\n", reg, offset));
-                    } else {
-                        return Err(format!("Variable {} not found", name));
-                    }
-                }
-                _ => {
-                    return Err("Unsupported argument type for FFI".to_string());
-                }
-            }
-            
-            // Windows 64-bit uses RCX, RDX, R8, R9 for first 4 arguments
-            if i >= 3 {
-                break;
-            }
-        }
-        
-        // Align stack for Windows calling convention
-        asm.push_str("    sub rsp, 32          ; Shadow space\n");
-        asm.push_str(&format!("    call {}\n", func_label));
-        asm.push_str("    add rsp, 32          ; Clean up shadow space\n");
-        
-        Ok(asm)
-    }
 }
 
 impl Backend for Windows64Backend {
@@ -2986,7 +2803,7 @@ impl Backend for Windows64Backend {
                         _ => {
                             // Stack arguments (after shadow space and return address)
                             let offset = 48 + (i - 4) * 8; // 32 shadow + 8 return + 8 saved rbp
-                            let offset_i32 = offset as i32; // FIXED: Convert to i32
+                            let offset_i32 = offset as i32; // Convert to i32
                             asm.push_str(&format!("    ; {} -> [rbp + {}]\n", arg, offset));
                             func_ctx.add_local(arg.clone(), -offset_i32, None);
                         }
@@ -3112,9 +2929,6 @@ impl Backend for Windows64Backend {
         asm.push_str("printf_format_int:\n");
         asm.push_str("    db '%d', 0           ; printf format string for integers\n\n");
         asm.push_str(&self.generate_string_data());
-        
-        // SSD: Inject external assembly
-        asm = self.inject_external_asm(&asm, &self.external_asm);
         
         Ok(asm)
     }

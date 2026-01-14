@@ -17,11 +17,6 @@ pub struct CompilerConfig {
     pub verbose: bool,
     pub keep_assembly: bool,
     pub modules: Vec<String>,
-    pub ssd_headers: Vec<String>,
-    pub ssd_assembly: Vec<String>,
-    pub enable_ssd: bool,
-    pub enable_rcl: bool,
-    pub rcl_libraries: Vec<String>,
 }
 
 impl Default for CompilerConfig {
@@ -36,11 +31,6 @@ impl Default for CompilerConfig {
             verbose: false,
             keep_assembly: false,
             modules: Vec::new(),
-            ssd_headers: Vec::new(),
-            ssd_assembly: Vec::new(),
-            enable_ssd: false,
-            enable_rcl: false,
-            rcl_libraries: Vec::new(),
         }
     }
 }
@@ -80,7 +70,7 @@ pub struct CompilationStats {
     pub compilation_time_ms: u128,
 }
 
-pub struct EarthngCompiler {
+pub struct EarthangCompiler {
     pub config: CompilerConfig,
     backend_registry: BackendRegistry,
     hardware_dsl: Option<HardwareDSL>,
@@ -94,10 +84,15 @@ pub struct EarthngCompiler {
 
 #[derive(Debug, Clone)]
 struct VariableInfo {
+    #[allow(dead_code)]
     pub name: String,
+    #[allow(dead_code)]
     pub type_hint: Option<String>,
+    #[allow(dead_code)]
     pub scope_level: usize,
+    #[allow(dead_code)]
     pub is_hardware: bool,
+    #[allow(dead_code)]
     pub hardware_device: Option<String>,
 }
 
@@ -106,7 +101,7 @@ pub trait OptimizationPass {
     fn optimize(&self, program: &mut Program) -> Result<(), String>;
 }
 
-impl EarthngCompiler {
+impl EarthangCompiler {
     pub fn new(config: CompilerConfig) -> Self {
         let mut compiler = Self {
             config,
@@ -193,6 +188,7 @@ impl EarthngCompiler {
         }
     }
     
+    #[allow(dead_code)]
     fn handle_extension_call(
         &self,
         func: &str,
@@ -327,7 +323,7 @@ impl EarthngCompiler {
             functions_compiled: program.body.iter()
                 .filter(|stmt| matches!(stmt, Statement::FunctionDef { .. }))
                 .count(),
-            hardware_intrinsics: backend_module.external_asm.len(),
+            hardware_intrinsics: 0, // No longer tracking hardware intrinsics separately
             compilation_time_ms: compilation_time,
         };
         
@@ -359,21 +355,15 @@ impl EarthngCompiler {
     fn compile_with_backend(
         &mut self,
         program: &Program,
-        module: &BackendModule
+        _module: &BackendModule
     ) -> Result<String, String> {
         match self.config.target {
             Target::Bios16 => {
                 let mut bios16_backend = crate::backend::Bios16Backend::new();
-                for asm in &module.external_asm {
-                    bios16_backend.add_external_asm(asm);
-                }
                 bios16_backend.compile_program(program)
             }
             Target::Bios32 => {
                 let mut bios32_backend = crate::backend::Bios32Backend::new();
-                for asm in &module.external_asm {
-                    bios32_backend.add_external_asm(asm);
-                }
                 bios32_backend.compile_program(program)
             }
             Target::Bios64 | Target::Bios64Sse | Target::Bios64Avx | Target::Bios64Avx512 => {
@@ -385,19 +375,6 @@ impl EarthngCompiler {
                     Target::Bios64Avx512 => backend_mut.with_avx512(),
                     _ => backend_mut,
                 };
-                
-                for asm in &module.external_asm {
-                    backend_mut.add_external_asm(asm);
-                }
-                
-                for ext in &module.syntax_extensions {
-                    backend_mut.add_syntax_extension(
-                        &ext.pattern,
-                        &ext.replacement,
-                        ext.assembly_label.as_deref(),
-                        ext.register_args.clone(),
-                    );
-                }
                 
                 backend_mut.compile_program(program)
             }
@@ -413,7 +390,7 @@ impl EarthngCompiler {
         }
     }
     
-    fn create_backend_module(&self, _program: &Program, hardware_asm: Vec<String>) -> BackendModule {
+    fn create_backend_module(&self, _program: &Program, _hardware_asm: Vec<String>) -> BackendModule {
         let mut required_capabilities = Vec::new();
         
         match self.config.target {
@@ -456,16 +433,10 @@ impl EarthngCompiler {
             }
         }
         
-        if self.config.hardware_dsl_enabled && !hardware_asm.is_empty() {
-            required_capabilities.push(Capability::Graphics);
-        }
-        
         BackendModule {
             functions: Vec::new(),
             globals: Vec::new(),
             required_capabilities,
-            external_asm: hardware_asm,
-            syntax_extensions: Vec::new(),
         }
     }
     
@@ -678,7 +649,7 @@ impl OptimizationPass for InlineExpansionPass {
 
 pub fn compile(source: &str, target: Target) -> Result<CompilationResult, String> {
     let config = CompilerConfig::default().with_target(target);
-    let mut compiler = EarthngCompiler::new(config);
+    let mut compiler = EarthangCompiler::new(config);
     compiler.compile(source)
 }
 
@@ -687,12 +658,12 @@ pub fn compile_with_hardware(source: &str, target: Target) -> Result<Compilation
         .with_target(target)
         .with_hardware_dsl(true);
     
-    let mut compiler = EarthngCompiler::new(config);
+    let mut compiler = EarthangCompiler::new(config);
     compiler.compile(source)
 }
 
 pub fn compile_with_config(source: &str, config: CompilerConfig) -> Result<CompilationResult, String> {
-    let mut compiler = EarthngCompiler::new(config);
+    let mut compiler = EarthangCompiler::new(config);
     compiler.compile(source)
 }
 
@@ -730,7 +701,6 @@ pub fn format_result(result: &CompilationResult) -> String {
     output.push_str(&format!("  Assembly lines: {}\n", result.stats.assembly_lines));
     output.push_str(&format!("  Variables allocated: {}\n", result.stats.variables_allocated));
     output.push_str(&format!("  Functions compiled: {}\n", result.stats.functions_compiled));
-    output.push_str(&format!("  Hardware intrinsics: {}\n", result.stats.hardware_intrinsics));
     output.push_str(&format!("  Compilation time: {}ms\n", result.stats.compilation_time_ms));
     
     output
@@ -738,6 +708,6 @@ pub fn format_result(result: &CompilationResult) -> String {
 
 pub fn compile_with_extensions(source: &str, target: Target) -> Result<CompilationResult, String> {
     let config = CompilerConfig::default().with_target(target);
-    let mut compiler = EarthngCompiler::new(config);
+    let mut compiler = EarthangCompiler::new(config);
     compiler.compile(source)
 }
