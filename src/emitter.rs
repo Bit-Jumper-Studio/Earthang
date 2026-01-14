@@ -1,7 +1,6 @@
 use std::collections::HashMap;
 use crate::parser::{Program, Statement, Expr, Op}; 
 
-// ========== TARGET CONFIGURATION ==========
 
 #[derive(Debug, Clone, PartialEq)]
 pub enum TargetPlatform {
@@ -42,7 +41,6 @@ impl TargetConfig {
     pub fn is_linux(&self) -> bool { self.platform == TargetPlatform::Linux64 }
 }
 
-// ========== NASM EMITTER ==========
 
 pub struct NasmEmitter {
     pub target: TargetConfig,
