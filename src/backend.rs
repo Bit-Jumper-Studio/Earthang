@@ -1,3 +1,4 @@
+// dont mind the warnings, im too lazy to remove them, its working, dont mess with something thats already working
 use crate::parser::{Program, Statement, Expr, Op, CompareOp};
 use crate::dsl::{HardwareDSL};
 use std::collections::HashMap;
@@ -434,8 +435,7 @@ pub trait Backend {
     /// Format for NASM
     #[allow(dead_code)]
     fn format(&self) -> &'static str;
-    
-    /// Can this backend handle the module's requirements?
+
     fn can_compile(&self, module: &BackendModule) -> bool {
         module.required_capabilities.iter()
             .all(|cap| self.supported_capabilities().contains(cap))
@@ -1081,8 +1081,6 @@ impl Bios64Backend {
         }
     }
     
-    // Note: GDT tables are NOT here anymore - they're in the code section
-    
     data
 }
 
@@ -1206,35 +1204,26 @@ fn generate_utility_functions(&self) -> String {
 }
     
     fn compile_expression_impl(&mut self, expr: &Expr, func_ctx: &mut Option<&mut FunctionContext>) -> Result<String, String> {
-        let mut code = String::new();
-        
-        match expr {
-            Expr::Number(n, _) => {
-                code.push_str(&format!("    ; Number: {}\n", n));
-                code.push_str(&format!("    mov rax, {}\n", n));
-            }
-            Expr::String(s, _) => {
-                let label = self.store_string_literal(s);
-                code.push_str(&format!("    ; String: '{}'\n", s.replace("'", "''")));
-                code.push_str(&format!("    mov rsi, {}\n", label));
-            }
-            Expr::Var(name, _) => {
-                if let Some(ctx) = func_ctx {
-                    if let Some(var_info) = ctx.get_local(name) {
-                        code.push_str(&format!("    ; Local variable: {} at [rbp - {}]\n", name, var_info.offset));
-                        code.push_str(&format!("    mov rax, [rbp - {}]\n", var_info.offset));
-                    } else if let Some(symbol) = ctx.get_symbol(name) {
-                        code.push_str(&format!("    ; Function symbol: {}\n", name));
-                        code.push_str(&format!("    mov rax, [{}]\n", symbol.name));
-                    } else {
-                        match self.get_variable_address(name) {
-                            Ok(address) => {
-                                code.push_str(&format!("    ; Global variable: {} (label: {})\n", name, address));
-                                code.push_str(&format!("    mov rax, [{}]\n", address));
-                            }
-                            Err(e) => return Err(e),
-                        }
-                    }
+    let mut code = String::new();
+    
+    match expr {
+        Expr::Number(n, _) => {
+            code.push_str(&format!("    ; Number: {}\n", n));
+            code.push_str(&format!("    mov rax, {}\n", n));
+        }
+        Expr::String(s, _) => {
+            let label = self.store_string_literal(s);
+            code.push_str(&format!("    ; String: '{}'\n", s.replace("'", "''")));
+            code.push_str(&format!("    mov rsi, {}\n", label));
+        }
+        Expr::Var(name, _) => {
+            if let Some(ctx) = func_ctx {
+                if let Some(var_info) = ctx.get_local(name) {
+                    code.push_str(&format!("    ; Local variable: {} at [rbp - {}]\n", name, var_info.offset));
+                    code.push_str(&format!("    mov rax, [rbp - {}]\n", var_info.offset));
+                } else if let Some(symbol) = ctx.get_symbol(name) {
+                    code.push_str(&format!("    ; Function symbol: {}\n", name));
+                    code.push_str(&format!("    mov rax, [{}]\n", symbol.name));
                 } else {
                     match self.get_variable_address(name) {
                         Ok(address) => {
@@ -1244,285 +1233,70 @@ fn generate_utility_functions(&self) -> String {
                         Err(e) => return Err(e),
                     }
                 }
-            }
-            Expr::Call { func, args, kwargs: _, span: _ } => {
-                if func == "print" {
-                    if let Some(arg) = args.get(0) {
-                        match arg {
-                            Expr::Number(_n, _) => {
-                                code.push_str(&self.compile_expression_impl(arg, func_ctx)?);
-                                code.push_str("    call print_decimal_64\n");
-                            }
-                            Expr::String(s, _) => {
-                                let label = self.store_string_literal(s);
-                                code.push_str(&format!("    ; Print string: '{}'\n", s.replace("'", "''")));
-                                code.push_str(&format!("    mov rsi, {}\n", label));
-                                code.push_str("    mov rdi, rsi\n");
-                                code.push_str("    call print_string_64\n");
-                            }
-                            Expr::Var(_name, _) => {
-                                code.push_str(&self.compile_expression_impl(arg, func_ctx)?);
-                                code.push_str("    call print_decimal_64\n");
-                            }
-                            Expr::BinOp { left, op, right, span: _ } => {
-                                let left_code = self.compile_expression_impl(left, func_ctx)?;
-                                let right_code = self.compile_expression_impl(right, func_ctx)?;
-                                
-                                code.push_str(&left_code);
-                                code.push_str("    push rax\n");
-                                code.push_str(&right_code);
-                                code.push_str("    mov rbx, rax\n");
-                                code.push_str("    pop rax\n");
-                                
-                                match op {
-                                    Op::Add => code.push_str("    add rax, rbx\n"),
-                                    Op::Sub => code.push_str("    sub rax, rbx\n"),
-                                    Op::Mul => code.push_str("    imul rax, rbx\n"),
-                                    Op::Div => {
-                                        code.push_str("    xor rdx, rdx\n");
-                                        code.push_str("    idiv rbx\n");
-                                    }
-                                    Op::Mod => {
-                                        code.push_str("    xor rdx, rdx\n");
-                                        code.push_str("    div rbx\n");
-                                        code.push_str("    mov rax, rdx\n");
-                                    }
-                                    _ => return Err(format!("Unsupported operator in print: {:?}", op)),
-                                }
-                                
-                                code.push_str("    call print_decimal_64\n");
-                            }
-                            _ => return Err(format!("Unsupported print argument type: {:?}", arg)),
-                        }
-                    } else {
-                        let label = self.store_string_literal("\n");
-                        code.push_str("    ; Empty print - newline\n");
-                        code.push_str(&format!("    mov rsi, {}\n", label));
-                        code.push_str("    mov rdi, rsi\n");
-                        code.push_str("    call print_string_64\n");
+            } else {
+                match self.get_variable_address(name) {
+                    Ok(address) => {
+                        code.push_str(&format!("    ; Global variable: {} (label: {})\n", name, address));
+                        code.push_str(&format!("    mov rax, [{}]\n", address));
                     }
-                } else {
-                    code.push_str(&format!("    ; Function call: {}\n", func));
-                    
-                    for (i, arg) in args.iter().enumerate() {
-                        let arg_code = self.compile_expression_impl(arg, func_ctx)?;
-                        code.push_str(&arg_code);
-                        
-                        match i {
-                            0 => code.push_str("    mov rdi, rax\n"),
-                            1 => code.push_str("    mov rsi, rax\n"),
-                            2 => code.push_str("    mov rdx, rax\n"),
-                            3 => code.push_str("    mov rcx, rax\n"),
-                            4 => code.push_str("    mov r8, rax\n"),
-                            5 => code.push_str("    mov r9, rax\n"),
-                            _ => {
-                                code.push_str("    push rax\n");
-                            }
-                        }
-                    }
-                    
-                    if args.len() > 6 {
-                        let stack_args = args.len() - 6;
-                        if stack_args % 2 != 0 {
-                            code.push_str("    sub rsp, 8\n");
-                        }
-                    }
-                    
-                    code.push_str(&format!("    call {}\n", func));
-                    
-                    if args.len() > 6 {
-                        let stack_args = args.len() - 6;
-                        code.push_str(&format!("    add rsp, {}\n", stack_args * 8));
-                    }
+                    Err(e) => return Err(e),
                 }
-            }
-            Expr::BinOp { left, op, right, span: _ } => {
-                code.push_str(&self.compile_expression_impl(left, func_ctx)?);
-                code.push_str("    push rax\n");
-                
-                code.push_str(&self.compile_expression_impl(right, func_ctx)?);
-                code.push_str("    mov rbx, rax\n");
-                code.push_str("    pop rax\n");
-                
-                match op {
-                    Op::Add => {
-                        code.push_str("    add rax, rbx\n");
-                    }
-                    Op::Sub => {
-                        code.push_str("    sub rax, rbx\n");
-                    }
-                    Op::Mul => {
-                        code.push_str("    imul rax, rbx\n");
-                    }
-                    Op::Div => {
-                        code.push_str("    xor rdx, rdx\n");
-                        code.push_str("    idiv rbx\n");
-                    }
-                    Op::Mod => {
-                        code.push_str("    xor rdx, rdx\n");
-                        code.push_str("    div rbx\n");
-                        code.push_str("    mov rax, rdx\n");
-                    }
-                    _ => {
-                        return Err(format!("Unsupported operator: {:?}", op));
-                    }
-                }
-            }
-            Expr::Compare { left, ops, comparators, span: _ } => {
-                // Simple comparison with one operator
-                if ops.len() == 1 && comparators.len() == 1 {
-                    let op = &ops[0];
-                    let comparator = &comparators[0];
-                    
-                    // Compile left expression
-                    code.push_str(&self.compile_expression_impl(left, func_ctx)?);
-                    code.push_str("    push rax\n");
-                    
-                    // Compile comparator expression
-                    code.push_str(&self.compile_expression_impl(comparator, func_ctx)?);
-                    code.push_str("    mov rbx, rax\n");
-                    code.push_str("    pop rax\n");
-                    
-                    // Compare and set result
-                    code.push_str("    cmp rax, rbx\n");
-                    
-                    match op {
-                        CompareOp::Lt => {
-                            code.push_str("    setl al\n");
-                        }
-                        CompareOp::Gt => {
-                            code.push_str("    setg al\n");
-                        }
-                        CompareOp::Eq => {
-                            code.push_str("    sete al\n");
-                        }
-                        CompareOp::Ne => {
-                            code.push_str("    setne al\n");
-                        }
-                        CompareOp::Le => {
-                            code.push_str("    setle al\n");
-                        }
-                        CompareOp::Ge => {
-                            code.push_str("    setge al\n");
-                        }
-                        _ => {
-                            return Err(format!("Unsupported comparison operator: {:?}", op));
-                        }
-                    }
-                    
-                    code.push_str("    movzx rax, al\n");
-                } else {
-                    return Err("Complex comparisons not supported yet".to_string());
-                }
-            }
-            _ => {
-                return Err(format!("Unsupported expression type: {:?}", expr));
             }
         }
-        
-        Ok(code)
-    }
-    
-    fn compile_statement(&mut self, stmt: &Statement, func_ctx: &mut FunctionContext) -> Result<String, String> {
-        let mut code = String::new();
-        
-        match stmt {
-            Statement::VarDecl { name, value, type_hint: _, span: _ } => {
-                let offset = func_ctx.allocate_local_variable(name, None)?;
-                
-                code.push_str(&format!("    ; Variable declaration: {} at [rbp - {}]\n", name, offset));
-                
-                {
-                    let value_code = self.compile_expression_impl(value, &mut Some(func_ctx))?;
-                    code.push_str(&value_code);
+        Expr::UnaryOp { op, operand, span: _ } => {
+            // First compile the operand
+            code.push_str(&self.compile_expression_impl(operand, func_ctx)?);
+            
+            match op {
+                crate::parser::UnaryOp::Minus => {
+                    code.push_str("    ; Unary minus\n");
+                    code.push_str("    neg rax\n");
                 }
-                
-                code.push_str(&format!("    mov [rbp - {}], rax\n", offset));
-            }
-            Statement::Assign { target, value, span: _ } => {
-                if let Some(var_info) = func_ctx.get_local(target) {
-                    let offset = var_info.offset;
-                    code.push_str(&format!("    ; Assignment to local: {} at [rbp - {}]\n", target, offset));
-                    
-                    {
-                        let value_code = self.compile_expression_impl(value, &mut Some(func_ctx))?;
-                        code.push_str(&value_code);
-                    }
-                    
-                    code.push_str(&format!("    mov [rbp - {}], rax\n", offset));
-                } else {
-                    match self.get_variable_address(target) {
-                        Ok(address) => {
-                            code.push_str(&format!("    ; Assignment to global: {} (label: {})\n", target, address));
-                            
-                            {
-                                let value_code = self.compile_expression_impl(value, &mut Some(func_ctx))?;
-                                code.push_str(&value_code);
-                            }
-                            
-                            code.push_str(&format!("    mov [{}], rax\n", address));
-                        }
-                        Err(e) => return Err(e),
-                    }
+                crate::parser::UnaryOp::Plus => {
+                    code.push_str("    ; Unary plus (no-op)\n");
+                    // Nothing to do - already in rax
+                }
+                crate::parser::UnaryOp::Not => {
+                    code.push_str("    ; Logical NOT\n");
+                    code.push_str("    test rax, rax\n");
+                    code.push_str("    sete al\n");
+                    code.push_str("    movzx rax, al\n");
+                }
+                crate::parser::UnaryOp::Invert => {
+                    code.push_str("    ; Bitwise NOT\n");
+                    code.push_str("    not rax\n");
                 }
             }
-            Statement::AugAssign { target, op, value, span: _ } => {
-                // Load current value
-                if let Some(var_info) = func_ctx.get_local(target) {
-                    let offset = var_info.offset;
-                    code.push_str(&format!("    ; Augmented assignment to local: {} at [rbp - {}]\n", target, offset));
-                    
-                    // Load current value
-                    code.push_str(&format!("    mov rax, [rbp - {}]\n", offset));
-                    code.push_str("    push rax\n");
-                    
-                    // Compile right-hand side
-                    {
-                        let value_code = self.compile_expression_impl(value, &mut Some(func_ctx))?;
-                        code.push_str(&value_code);
-                    }
-                    
-                    code.push_str("    mov rbx, rax\n");
-                    code.push_str("    pop rax\n");
-                    
-                    // Perform operation
-                    match op {
-                        Op::Add => code.push_str("    add rax, rbx\n"),
-                        Op::Sub => code.push_str("    sub rax, rbx\n"),
-                        Op::Mul => code.push_str("    imul rax, rbx\n"),
-                        Op::Div => {
-                            code.push_str("    xor rdx, rdx\n");
-                            code.push_str("    idiv rbx\n");
+        }
+        Expr::Call { func, args, kwargs: _, span: _ } => {
+            if func == "print" {
+                if let Some(arg) = args.get(0) {
+                    match arg {
+                        Expr::Number(_n, _) => {
+                            code.push_str(&self.compile_expression_impl(arg, func_ctx)?);
+                            code.push_str("    call print_decimal_64\n");
                         }
-                        Op::Mod => {
-                            code.push_str("    xor rdx, rdx\n");
-                            code.push_str("    div rbx\n");
-                            code.push_str("    mov rax, rdx\n");
+                        Expr::String(s, _) => {
+                            let label = self.store_string_literal(s);
+                            code.push_str(&format!("    ; Print string: '{}'\n", s.replace("'", "''")));
+                            code.push_str(&format!("    mov rsi, {}\n", label));
+                            code.push_str("    mov rdi, rsi\n");
+                            code.push_str("    call print_string_64\n");
                         }
-                        _ => return Err(format!("Unsupported augmented assignment operator: {:?}", op)),
-                    }
-                    
-                    // Store back
-                    code.push_str(&format!("    mov [rbp - {}], rax\n", offset));
-                } else {
-                    match self.get_variable_address(target) {
-                        Ok(address) => {
-                            code.push_str(&format!("    ; Augmented assignment to global: {} (label: {})\n", target, address));
+                        Expr::Var(_name, _) => {
+                            code.push_str(&self.compile_expression_impl(arg, func_ctx)?);
+                            code.push_str("    call print_decimal_64\n");
+                        }
+                        Expr::BinOp { left, op, right, span: _ } => {
+                            let left_code = self.compile_expression_impl(left, func_ctx)?;
+                            let right_code = self.compile_expression_impl(right, func_ctx)?;
                             
-                            // Load current value
-                            code.push_str(&format!("    mov rax, [{}]\n", address));
+                            code.push_str(&left_code);
                             code.push_str("    push rax\n");
-                            
-                            // Compile right-hand side
-                            {
-                                let value_code = self.compile_expression_impl(value, &mut Some(func_ctx))?;
-                                code.push_str(&value_code);
-                            }
-                            
+                            code.push_str(&right_code);
                             code.push_str("    mov rbx, rax\n");
                             code.push_str("    pop rax\n");
                             
-                            // Perform operation
                             match op {
                                 Op::Add => code.push_str("    add rax, rbx\n"),
                                 Op::Sub => code.push_str("    sub rax, rbx\n"),
@@ -1536,174 +1310,426 @@ fn generate_utility_functions(&self) -> String {
                                     code.push_str("    div rbx\n");
                                     code.push_str("    mov rax, rdx\n");
                                 }
-                                _ => return Err(format!("Unsupported augmented assignment operator: {:?}", op)),
+                                _ => return Err(format!("Unsupported operator in print: {:?}", op)),
                             }
                             
-                            // Store back
-                            code.push_str(&format!("    mov [{}], rax\n", address));
+                            code.push_str("    call print_decimal_64\n");
                         }
-                        Err(e) => return Err(e),
+                        _ => return Err(format!("Unsupported print argument type: {:?}", arg)),
+                    }
+                } else {
+                    let label = self.store_string_literal("\n");
+                    code.push_str("    ; Empty print - newline\n");
+                    code.push_str(&format!("    mov rsi, {}\n", label));
+                    code.push_str("    mov rdi, rsi\n");
+                    code.push_str("    call print_string_64\n");
+                }
+            } else {
+                code.push_str(&format!("    ; Function call: {}\n", func));
+                
+                for (i, arg) in args.iter().enumerate() {
+                    let arg_code = self.compile_expression_impl(arg, func_ctx)?;
+                    code.push_str(&arg_code);
+                    
+                    match i {
+                        0 => code.push_str("    mov rdi, rax\n"),
+                        1 => code.push_str("    mov rsi, rax\n"),
+                        2 => code.push_str("    mov rdx, rax\n"),
+                        3 => code.push_str("    mov rcx, rax\n"),
+                        4 => code.push_str("    mov r8, rax\n"),
+                        5 => code.push_str("    mov r9, rax\n"),
+                        _ => {
+                            code.push_str("    push rax\n");
+                        }
                     }
                 }
+                
+                if args.len() > 6 {
+                    let stack_args = args.len() - 6;
+                    if stack_args % 2 != 0 {
+                        code.push_str("    sub rsp, 8\n");
+                    }
+                }
+                
+                code.push_str(&format!("    call {}\n", func));
+                
+                if args.len() > 6 {
+                    let stack_args = args.len() - 6;
+                    code.push_str(&format!("    add rsp, {}\n", stack_args * 8));
+                }
             }
-            Statement::Expr(expr) => {
-                code.push_str("    ; Expression statement\n");
+        }
+        Expr::BinOp { left, op, right, span: _ } => {
+            code.push_str(&self.compile_expression_impl(left, func_ctx)?);
+            code.push_str("    push rax\n");
+            
+            code.push_str(&self.compile_expression_impl(right, func_ctx)?);
+            code.push_str("    mov rbx, rax\n");
+            code.push_str("    pop rax\n");
+            
+            match op {
+                Op::Add => {
+                    code.push_str("    add rax, rbx\n");
+                }
+                Op::Sub => {
+                    code.push_str("    sub rax, rbx\n");
+                }
+                Op::Mul => {
+                    code.push_str("    imul rax, rbx\n");
+                }
+                Op::Div => {
+                    code.push_str("    xor rdx, rdx\n");
+                    code.push_str("    idiv rbx\n");
+                }
+                Op::Mod => {
+                    code.push_str("    xor rdx, rdx\n");
+                    code.push_str("    div rbx\n");
+                    code.push_str("    mov rax, rdx\n");
+                }
+                _ => {
+                    return Err(format!("Unsupported operator: {:?}", op));
+                }
+            }
+        }
+        Expr::Compare { left, ops, comparators, span: _ } => {
+            // Simple comparison with one operator
+            if ops.len() == 1 && comparators.len() == 1 {
+                let op = &ops[0];
+                let comparator = &comparators[0];
+                
+                // Compile left expression
+                code.push_str(&self.compile_expression_impl(left, func_ctx)?);
+                code.push_str("    push rax\n");
+                
+                // Compile comparator expression
+                code.push_str(&self.compile_expression_impl(comparator, func_ctx)?);
+                code.push_str("    mov rbx, rax\n");
+                code.push_str("    pop rax\n");
+                
+                // Compare and set result
+                code.push_str("    cmp rax, rbx\n");
+                
+                match op {
+                    CompareOp::Lt => {
+                        code.push_str("    setl al\n");
+                    }
+                    CompareOp::Gt => {
+                        code.push_str("    setg al\n");
+                    }
+                    CompareOp::Eq => {
+                        code.push_str("    sete al\n");
+                    }
+                    CompareOp::Ne => {
+                        code.push_str("    setne al\n");
+                    }
+                    CompareOp::Le => {
+                        code.push_str("    setle al\n");
+                    }
+                    CompareOp::Ge => {
+                        code.push_str("    setge al\n");
+                    }
+                    _ => {
+                        return Err(format!("Unsupported comparison operator: {:?}", op));
+                    }
+                }
+                
+                code.push_str("    movzx rax, al\n");
+            } else {
+                return Err("Complex comparisons not supported yet".to_string());
+            }
+        }
+        _ => {
+            return Err(format!("Unsupported expression type: {:?}", expr));
+        }
+    }
+    
+    Ok(code)
+}
+    
+    fn compile_statement(&mut self, stmt: &Statement, func_ctx: &mut FunctionContext) -> Result<String, String> {
+    let mut code = String::new();
+    
+    match stmt {
+        Statement::VarDecl { name, value, type_hint: _, span: _ } => {
+            let offset = func_ctx.allocate_local_variable(name, None)?;
+            
+            code.push_str(&format!("    ; Variable declaration: {} at [rbp - {}]\n", name, offset));
+            
+            {
+                let value_code = self.compile_expression_impl(value, &mut Some(func_ctx))?;
+                code.push_str(&value_code);
+            }
+            
+            code.push_str(&format!("    mov [rbp - {}], rax\n", offset));
+        }
+        Statement::Assign { target, value, span: _ } => {
+            if let Some(var_info) = func_ctx.get_local(target) {
+                let offset = var_info.offset;
+                code.push_str(&format!("    ; Assignment to local: {} at [rbp - {}]\n", target, offset));
+                
+                {
+                    let value_code = self.compile_expression_impl(value, &mut Some(func_ctx))?;
+                    code.push_str(&value_code);
+                }
+                
+                code.push_str(&format!("    mov [rbp - {}], rax\n", offset));
+            } else {
+                match self.get_variable_address(target) {
+                    Ok(address) => {
+                        code.push_str(&format!("    ; Assignment to global: {} (label: {})\n", target, address));
+                        
+                        {
+                            let value_code = self.compile_expression_impl(value, &mut Some(func_ctx))?;
+                            code.push_str(&value_code);
+                        }
+                        
+                        code.push_str(&format!("    mov [{}], rax\n", address));
+                    }
+                    Err(e) => return Err(e),
+                }
+            }
+        }
+        Statement::AugAssign { target, op, value, span: _ } => {
+            // Load current value
+            if let Some(var_info) = func_ctx.get_local(target) {
+                let offset = var_info.offset;
+                code.push_str(&format!("    ; Augmented assignment to local: {} at [rbp - {}]\n", target, offset));
+                
+                // Load current value
+                code.push_str(&format!("    mov rax, [rbp - {}]\n", offset));
+                code.push_str("    push rax\n");
+                
+                // Compile right-hand side
+                {
+                    let value_code = self.compile_expression_impl(value, &mut Some(func_ctx))?;
+                    code.push_str(&value_code);
+                }
+                
+                code.push_str("    mov rbx, rax\n");
+                code.push_str("    pop rax\n");
+                
+                // Perform operation
+                match op {
+                    Op::Add => code.push_str("    add rax, rbx\n"),
+                    Op::Sub => code.push_str("    sub rax, rbx\n"),
+                    Op::Mul => code.push_str("    imul rax, rbx\n"),
+                    Op::Div => {
+                        code.push_str("    xor rdx, rdx\n");
+                        code.push_str("    idiv rbx\n");
+                    }
+                    Op::Mod => {
+                        code.push_str("    xor rdx, rdx\n");
+                        code.push_str("    div rbx\n");
+                        code.push_str("    mov rax, rdx\n");
+                    }
+                    _ => return Err(format!("Unsupported augmented assignment operator: {:?}", op)),
+                }
+                
+                // Store back
+                code.push_str(&format!("    mov [rbp - {}], rax\n", offset));
+            } else {
+                match self.get_variable_address(target) {
+                    Ok(address) => {
+                        code.push_str(&format!("    ; Augmented assignment to global: {} (label: {})\n", target, address));
+                        
+                        // Load current value
+                        code.push_str(&format!("    mov rax, [{}]\n", address));
+                        code.push_str("    push rax\n");
+                        
+                        // Compile right-hand side
+                        {
+                            let value_code = self.compile_expression_impl(value, &mut Some(func_ctx))?;
+                            code.push_str(&value_code);
+                        }
+                        
+                        code.push_str("    mov rbx, rax\n");
+                        code.push_str("    pop rax\n");
+                        
+                        // Perform operation
+                        match op {
+                            Op::Add => code.push_str("    add rax, rbx\n"),
+                            Op::Sub => code.push_str("    sub rax, rbx\n"),
+                            Op::Mul => code.push_str("    imul rax, rbx\n"),
+                            Op::Div => {
+                                code.push_str("    xor rdx, rdx\n");
+                                code.push_str("    idiv rbx\n");
+                            }
+                            Op::Mod => {
+                                code.push_str("    xor rdx, rdx\n");
+                                code.push_str("    div rbx\n");
+                                code.push_str("    mov rax, rdx\n");
+                            }
+                            _ => return Err(format!("Unsupported augmented assignment operator: {:?}", op)),
+                        }
+                        
+                        // Store back
+                        code.push_str(&format!("    mov [{}], rax\n", address));
+                    }
+                    Err(e) => return Err(e),
+                }
+            }
+        }
+        Statement::Expr(expr) => {
+            code.push_str("    ; Expression statement\n");
+            {
+                let expr_code = self.compile_expression_impl(expr, &mut Some(func_ctx))?;
+                code.push_str(&expr_code);
+            }
+        }
+        Statement::Return(expr) => {
+            if let Some(expr) = expr {
+                code.push_str("    ; Return statement\n");
                 {
                     let expr_code = self.compile_expression_impl(expr, &mut Some(func_ctx))?;
                     code.push_str(&expr_code);
                 }
+            } else {
+                code.push_str("    xor rax, rax\n");
             }
-            Statement::Return(expr) => {
-                if let Some(expr) = expr {
-                    code.push_str("    ; Return statement\n");
-                    {
-                        let expr_code = self.compile_expression_impl(expr, &mut Some(func_ctx))?;
-                        code.push_str(&expr_code);
-                    }
-                } else {
-                    code.push_str("    xor rax, rax\n");
-                }
-                
-                if func_ctx.stack_size > 0 {
-                    code.push_str(&format!("    add rsp, {}\n", func_ctx.stack_size));
-                }
-                
-                code.push_str("    mov rsp, rbp\n");
-                code.push_str("    pop rbp\n");
-                code.push_str("    ret\n");
-                
-                func_ctx.has_returned = true;
+            
+            if func_ctx.stack_size > 0 {
+                code.push_str(&format!("    add rsp, {}\n", func_ctx.stack_size));
             }
-            Statement::If { condition, then_block, elif_blocks, else_block, span: _ } => {
-                let label_id = self.get_next_label_id();
-                let else_label = format!("if_else_{}", label_id);
-                let end_label = format!("if_end_{}", label_id);
+            
+            code.push_str("    mov rsp, rbp\n");
+            code.push_str("    pop rbp\n");
+            code.push_str("    ret\n");
+            
+            func_ctx.has_returned = true;
+        }
+        Statement::If { condition, then_block, elif_blocks, else_block, span: _ } => {
+            let label_id = self.get_next_label_id();
+            let else_label = format!("if_else_{}", label_id);
+            let end_label = format!("if_end_{}", label_id);
+            
+            code.push_str("    ; If condition\n");
+            {
+                let cond_code = self.compile_expression_impl(condition, &mut Some(func_ctx))?;
+                code.push_str(&cond_code);
+            }
+            
+            code.push_str("    test rax, rax\n");
+            code.push_str(&format!("    jz {}\n", else_label));
+            
+            code.push_str("    ; Then block\n");
+            for stmt in then_block {
+                let stmt_code = self.compile_statement(stmt, func_ctx)?;
+                code.push_str(&stmt_code);
+            }
+            code.push_str(&format!("    jmp {}\n", end_label));
+            
+            let mut current_else_label = else_label.clone();
+            for (i, (elif_cond, elif_body)) in elif_blocks.iter().enumerate() {
+                code.push_str(&format!("{}:\n", current_else_label));
                 
-                code.push_str("    ; If condition\n");
                 {
-                    let cond_code = self.compile_expression_impl(condition, &mut Some(func_ctx))?;
-                    code.push_str(&cond_code);
+                    let elif_cond_code = self.compile_expression_impl(elif_cond, &mut Some(func_ctx))?;
+                    code.push_str(&elif_cond_code);
                 }
+                
+                let next_label = if i < elif_blocks.len() - 1 || else_block.is_some() {
+                    format!("{}_elif_{}", current_else_label, i)
+                } else {
+                    end_label.clone()
+                };
                 
                 code.push_str("    test rax, rax\n");
-                code.push_str(&format!("    jz {}\n", else_label));
+                code.push_str(&format!("    jz {}\n", next_label));
                 
-                code.push_str("    ; Then block\n");
-                for stmt in then_block {
+                for stmt in elif_body {
                     let stmt_code = self.compile_statement(stmt, func_ctx)?;
                     code.push_str(&stmt_code);
                 }
                 code.push_str(&format!("    jmp {}\n", end_label));
                 
-                let mut current_else_label = else_label.clone();
-                for (i, (elif_cond, elif_body)) in elif_blocks.iter().enumerate() {
-                    code.push_str(&format!("{}:\n", current_else_label));
-                    
-                    {
-                        let elif_cond_code = self.compile_expression_impl(elif_cond, &mut Some(func_ctx))?;
-                        code.push_str(&elif_cond_code);
-                    }
-                    
-                    let next_label = if i < elif_blocks.len() - 1 || else_block.is_some() {
-                        format!("{}_elif_{}", current_else_label, i)
-                    } else {
-                        end_label.clone()
-                    };
-                    
-                    code.push_str("    test rax, rax\n");
-                    code.push_str(&format!("    jz {}\n", next_label));
-                    
-                    for stmt in elif_body {
-                        let stmt_code = self.compile_statement(stmt, func_ctx)?;
-                        code.push_str(&stmt_code);
-                    }
-                    code.push_str(&format!("    jmp {}\n", end_label));
-                    
-                    code.push_str(&format!("{}:\n", next_label));
-                    current_else_label = next_label;
-                }
-                
-                if let Some(else_body) = else_block {
-                    if elif_blocks.is_empty() {
-                        code.push_str(&format!("{}:\n", else_label));
-                    } else {
-                        code.push_str(&format!("{}:\n", current_else_label));
-                    }
-                    
-                    code.push_str("    ; Else block\n");
-                    for stmt in else_body {
-                        let stmt_code = self.compile_statement(stmt, func_ctx)?;
-                        code.push_str(&stmt_code);
-                    }
-                } else if elif_blocks.is_empty() {
-                    code.push_str(&format!("{}:\n", else_label));
-                }
-                
-                code.push_str(&format!("{}:\n", end_label));
+                code.push_str(&format!("{}:\n", next_label));
+                current_else_label = next_label;
             }
-            Statement::While { condition, body, orelse: _, span: _ } => {
-                let label_id = self.get_next_label_id();
-                let while_start = format!("while_start_{}", label_id);
-                let while_end = format!("while_end_{}", label_id);
-                
-                // Push loop labels to stack
-                self.loop_stack.borrow_mut().push((while_start.clone(), while_end.clone()));
-                
-                code.push_str(&format!("{}:\n", while_start));
-                
-                code.push_str("    ; While condition\n");
-                {
-                    let cond_code = self.compile_expression_impl(condition, &mut Some(func_ctx))?;
-                    code.push_str(&cond_code);
+            
+            if let Some(else_body) = else_block {
+                if elif_blocks.is_empty() {
+                    code.push_str(&format!("{}:\n", else_label));
+                } else {
+                    code.push_str(&format!("{}:\n", current_else_label));
                 }
                 
-                code.push_str("    test rax, rax\n");
-                code.push_str(&format!("    jz {}\n", while_end));
-                
-                code.push_str("    ; While body\n");
-                for stmt in body {
+                code.push_str("    ; Else block\n");
+                for stmt in else_body {
                     let stmt_code = self.compile_statement(stmt, func_ctx)?;
                     code.push_str(&stmt_code);
                 }
-                
-                code.push_str(&format!("    jmp {}\n", while_start));
-                code.push_str(&format!("{}:\n", while_end));
-                
-                // Pop loop labels from stack
-                self.loop_stack.borrow_mut().pop();
+            } else if elif_blocks.is_empty() {
+                code.push_str(&format!("{}:\n", else_label));
             }
-            Statement::FunctionDef { name, args: _, body: _, span: _ } => {
-                // Nested function definitions are compiled separately in compile_program
-                code.push_str(&format!("    ; Function definition: {}\n", name));
+            
+            code.push_str(&format!("{}:\n", end_label));
+        }
+        Statement::While { condition, body, orelse: _, span: _ } => {
+            let label_id = self.get_next_label_id();
+            let while_start = format!("while_start_{}", label_id);
+            let while_end = format!("while_end_{}", label_id);
+            
+            // Push loop labels to stack
+            self.loop_stack.borrow_mut().push((while_start.clone(), while_end.clone()));
+            
+            code.push_str(&format!("{}:\n", while_start));
+            
+            code.push_str("    ; While condition\n");
+            {
+                let cond_code = self.compile_expression_impl(condition, &mut Some(func_ctx))?;
+                code.push_str(&cond_code);
             }
-            Statement::HardwareFunctionDef { device, name, args: _, body: _, span: _ } => {
-                // Hardware function definitions are not supported in this context
-                code.push_str(&format!("    ; Hardware function definition: {} for device {}\n", name, device));
-                code.push_str("    ; Hardware functions must be defined at global scope\n");
+            
+            code.push_str("    test rax, rax\n");
+            code.push_str(&format!("    jz {}\n", while_end));
+            
+            code.push_str("    ; While body\n");
+            for stmt in body {
+                let stmt_code = self.compile_statement(stmt, func_ctx)?;
+                code.push_str(&stmt_code);
             }
-            Statement::Pass => {
-                code.push_str("    ; pass\n");
-            }
-            Statement::Break => {
-                if let Some((_, end_label)) = self.loop_stack.borrow().last() {
-                    code.push_str("    ; break\n");
-                    code.push_str(&format!("    jmp {}\n", end_label));
-                } else {
-                    return Err("break outside loop".to_string());
-                }
-            }
-            Statement::Continue => {
-                if let Some((start_label, _)) = self.loop_stack.borrow().last() {
-                    code.push_str("    ; continue\n");
-                    code.push_str(&format!("    jmp {}\n", start_label));
-                } else {
-                    return Err("continue outside loop".to_string());
-                }
+            
+            code.push_str(&format!("    jmp {}\n", while_start));
+            code.push_str(&format!("{}:\n", while_end));
+            
+            // Pop loop labels from stack
+            self.loop_stack.borrow_mut().pop();
+        }
+        Statement::FunctionDef { name, args: _, body: _, span: _ } => {
+            // Nested function definitions are compiled separately in compile_program
+            code.push_str(&format!("    ; Function definition: {}\n", name));
+        }
+        Statement::HardwareFunctionDef { device, name, args: _, body: _, span: _ } => {
+            // Hardware function definitions are not supported in this context
+            code.push_str(&format!("    ; Hardware function definition: {} for device {}\n", name, device));
+            code.push_str("    ; Hardware functions must be defined at global scope\n");
+        }
+        Statement::Pass => {
+            code.push_str("    ; pass\n");
+        }
+        Statement::Break => {
+            if let Some((_, end_label)) = self.loop_stack.borrow().last() {
+                code.push_str("    ; break\n");
+                code.push_str(&format!("    jmp {}\n", end_label));
+            } else {
+                return Err("break outside loop".to_string());
             }
         }
-        
-        Ok(code)
+        Statement::Continue => {
+            if let Some((start_label, _)) = self.loop_stack.borrow().last() {
+                code.push_str("    ; continue\n");
+                code.push_str(&format!("    jmp {}\n", start_label));
+            } else {
+                return Err("continue outside loop".to_string());
+            }
+        }
+        Statement::Include { .. } => {
+            return Err("Include statements should have been processed in the frontend".to_string());
+        }
     }
+    
+    Ok(code)
+}
     
     fn compile_function(&mut self, name: &str, args: &[String], body: &[Statement]) -> Result<String, String> {
         let mut code = String::new();
@@ -2443,16 +2469,13 @@ impl Linux64Backend {
         }
     }
 
-    // Helper methods
-    fn allocate_variable_sp_relative(&self, name: &str) -> i32 {
+    // RBP-RELATIVE ADDRESSING (FIXED VERSION)
+    fn allocate_variable_rbp_relative(&self, name: &str) -> i32 {
         let mut offset = self.current_stack_offset.borrow_mut();
         
-        if (*offset % 16) != 0 {
-            *offset += 8;
-        }
-        
-        let current = *offset;
-        *offset += 8;
+        // First variable at [rbp - 8], second at [rbp - 16], etc.
+        *offset -= 8;
+        let current = *offset;  // This is NEGATIVE (e.g., -8, -16, -24)
         
         self.symbol_table.borrow_mut().insert(name.to_string(), VariableInfo {
             name: name.to_string(),
@@ -2463,16 +2486,20 @@ impl Linux64Backend {
         current
     }
     
-    fn get_variable_offset_sp_relative(&self, name: &str) -> Option<i32> {
+    fn ensure_variable_exists_rbp_relative(&self, name: &str) -> i32 {
+        if let Some(var_info) = self.symbol_table.borrow().get(name) {
+            var_info.offset
+        } else {
+            self.allocate_variable_rbp_relative(name)
+        }
+    }
+    
+    fn get_variable_offset_rbp_relative(&self, name: &str) -> Option<i32> {
         self.symbol_table.borrow().get(name).map(|v| v.offset)
     }
     
-    fn ensure_variable_exists_sp_relative(&self, name: &str) -> i32 {
-        if let Some(offset) = self.get_variable_offset_sp_relative(name) {
-            offset
-        } else {
-            self.allocate_variable_sp_relative(name)
-        }
+    fn get_absolute_offset(&self, offset: i32) -> i32 {
+        if offset < 0 { -offset } else { offset }
     }
     
     fn get_string_label(&self, content: &str) -> String {
@@ -2496,34 +2523,6 @@ impl Linux64Backend {
             data.push_str(&format!("    db '{}', 0\n", content.replace("'", "''")));
         }
         data
-    }
-    
-    fn count_variables(&self, program: &Program) -> usize {
-        let mut count = 0;
-        let mut seen = std::collections::HashSet::new();
-        
-        for stmt in &program.body {
-            if let Statement::FunctionDef { .. } = stmt {
-                continue;
-            }
-            
-            match stmt {
-                Statement::VarDecl { name, .. } => {
-                    if !seen.contains(name) {
-                        seen.insert(name.clone());
-                        count += 1;
-                    }
-                }
-                Statement::Assign { target, .. } => {
-                    if !seen.contains(target) {
-                        seen.insert(target.clone());
-                        count += 1;
-                    }
-                }
-                _ => {}
-            }
-        }
-        count
     }
     
     fn get_next_label_id(&self) -> u32 {
@@ -2664,7 +2663,6 @@ impl Linux64Backend {
         helpers
     }
     
-    // FIXED: Helper to compile a statement in the main context
     fn compile_statement_in_context(&mut self, stmt: &Statement) -> Result<String, String> {
         let mut code = String::new();
         
@@ -2674,24 +2672,27 @@ impl Linux64Backend {
             }
             Statement::VarDecl { name, value, type_hint: _, span: _ } => {
                 code.push_str(&format!("    ; Variable declaration: {}\n", name));
-                let offset = self.allocate_variable_sp_relative(&name);
+                let offset = self.allocate_variable_rbp_relative(&name);
                 let value_code = self.compile_expression(&value)?;
                 code.push_str(&value_code);
-                code.push_str(&format!("    mov [rsp + {}], rax\n", offset));
+                let abs_offset = self.get_absolute_offset(offset);
+                code.push_str(&format!("    mov [rbp - {}], rax\n", abs_offset));
             }
             Statement::Assign { target, value, span: _ } => {
                 code.push_str(&format!("    ; Assignment to {}\n", target));
-                let offset = self.ensure_variable_exists_sp_relative(&target);
+                let offset = self.ensure_variable_exists_rbp_relative(&target);
                 let value_code = self.compile_expression(&value)?;
                 code.push_str(&value_code);
-                code.push_str(&format!("    mov [rsp + {}], rax\n", offset));
+                let abs_offset = self.get_absolute_offset(offset);
+                code.push_str(&format!("    mov [rbp - {}], rax\n", abs_offset));
             }
             Statement::AugAssign { target, op, value, span: _ } => {
                 code.push_str(&format!("    ; Augmented assignment to {}\n", target));
-                let offset = self.ensure_variable_exists_sp_relative(&target);
+                let offset = self.ensure_variable_exists_rbp_relative(&target);
+                let abs_offset = self.get_absolute_offset(offset);
                 
                 // Load current value
-                code.push_str(&format!("    mov rax, [rsp + {}]\n", offset));
+                code.push_str(&format!("    mov rax, [rbp - {}]\n", abs_offset));
                 code.push_str("    push rax\n");
                 
                 // Compile right-hand side
@@ -2719,7 +2720,7 @@ impl Linux64Backend {
                 }
                 
                 // Store back
-                code.push_str(&format!("    mov [rsp + {}], rax\n", offset));
+                code.push_str(&format!("    mov [rbp - {}], rax\n", abs_offset));
             }
             _ => {
                 code.push_str(&format!("    ; [Statement type not handled in context: {:?}]\n", stmt));
@@ -2765,54 +2766,141 @@ impl Backend for Linux64Backend {
         asm.push_str("_start:\n");
         asm.push_str("    ; Set up stack\n");
         asm.push_str("    mov rbp, rsp\n");
-        asm.push_str("    and rsp, -16\n");
+        asm.push_str("    and rsp, -16        ; 16-byte align stack\n");
+        asm.push_str("    \n");
+        asm.push_str("    ; Call main function\n");
         asm.push_str("    call main\n");
-        asm.push_str("    ; Exit after main returns\n");
-        asm.push_str("    mov rax, 60\n");
-        asm.push_str("    xor rdi, rdi\n");
+        asm.push_str("    \n");
+        asm.push_str("    ; Exit program\n");
+        asm.push_str("    mov rdi, rax        ; exit code\n");
+        asm.push_str("    mov rax, 60         ; syscall: exit\n");
         asm.push_str("    syscall\n\n");
         
         asm.push_str("main:\n");
+        asm.push_str("    ; Function prologue\n");
         asm.push_str("    push rbp\n");
         asm.push_str("    mov rbp, rsp\n");
-        asm.push_str("    and rsp, -16\n");
         
-        let var_count = self.count_variables(program);
-        if var_count > 0 {
-            let total_space = ((var_count * 8) + 15) & !15;
-            asm.push_str(&format!("    sub rsp, {}\n", total_space));
-        }
-        
+        // FIRST PASS: Allocate variables and track maximum negative offset
         {
             let mut offset = self.current_stack_offset.borrow_mut();
-            *offset = 16;
+            *offset = 0;  // RBP itself is at offset 0
             self.symbol_table.borrow_mut().clear();
         }
         
+        // Track the most negative offset we need
+        let mut max_negative_offset = 0;
+        
+        // Walk through program to allocate all variables
+        for stmt in &program.body {
+            match stmt {
+                Statement::VarDecl { name, .. } => {
+                    let offset = self.allocate_variable_rbp_relative(name);
+                    if offset < max_negative_offset {
+                        max_negative_offset = offset;
+                    }
+                }
+                Statement::Assign { target, .. } => {
+                    let offset = self.ensure_variable_exists_rbp_relative(target);
+                    if offset < max_negative_offset {
+                        max_negative_offset = offset;
+                    }
+                }
+                Statement::AugAssign { target, .. } => {
+                    let offset = self.ensure_variable_exists_rbp_relative(target);
+                    if offset < max_negative_offset {
+                        max_negative_offset = offset;
+                    }
+                }
+                _ => {}
+            }
+        }
+        
+        // Allocate stack space based on the most negative offset
+        // Since offsets are negative, we need to allocate -max_negative_offset bytes
+        if max_negative_offset < 0 {
+            let stack_space = (-max_negative_offset + 15) & !15;  // Round up to 16 bytes
+            asm.push_str(&format!("    sub rsp, {}        ; Allocate {} bytes for locals\n", stack_space, stack_space));
+            asm.push_str(&format!("    ; Variables span from [rbp - 8] to [rbp - {}]\n", -max_negative_offset));
+        }
+        
+        asm.push_str("\n");
+        
+        // SECOND PASS: Compile the statements
         for stmt in &program.body {
             match stmt {
                 Statement::Expr(expr) => {
-                    let expr_code = self.compile_expression(&expr)?;
+                    let expr_code = self.compile_expression(expr)?;
                     asm.push_str(&expr_code);
                 }
                 Statement::VarDecl { name, value, type_hint: _, span: _ } => {
                     asm.push_str(&format!("    ; Variable declaration: {}\n", name));
                     
-                    let offset = self.allocate_variable_sp_relative(&name);
-                    
-                    let value_code = self.compile_expression(&value)?;
-                    asm.push_str(&value_code);
-                    
-                    asm.push_str(&format!("    mov [rsp + {}], rax\n", offset));
+                    if let Some(offset) = self.get_variable_offset_rbp_relative(name) {
+                        // Compile the value
+                        let value_code = self.compile_expression(value)?;
+                        asm.push_str(&value_code);
+                        
+                        // Store to stack at [rbp - abs_offset]
+                        let abs_offset = self.get_absolute_offset(offset);
+                        asm.push_str(&format!("    mov [rbp - {}], rax\n", abs_offset));
+                    } else {
+                        return Err(format!("Variable {} not allocated", name));
+                    }
                 }
                 Statement::Assign { target, value, span: _ } => {
-                    if let Some(offset) = self.get_variable_offset_sp_relative(&target) {
-                        asm.push_str(&format!("    ; Assignment to {} at [rsp + {}]\n", target, offset));
-                        let value_code = self.compile_expression(&value)?;
+                    asm.push_str(&format!("    ; Assignment to {}\n", target));
+                    
+                    if let Some(offset) = self.get_variable_offset_rbp_relative(target) {
+                        // Compile the value
+                        let value_code = self.compile_expression(value)?;
                         asm.push_str(&value_code);
-                        asm.push_str(&format!("    mov [rsp + {}], rax\n", offset));
+                        
+                        // Store to stack
+                        let abs_offset = self.get_absolute_offset(offset);
+                        asm.push_str(&format!("    mov [rbp - {}], rax\n", abs_offset));
                     } else {
-                        return Err(format!("Undefined variable: {}", target));
+                        return Err(format!("Variable {} not found", target));
+                    }
+                }
+                Statement::AugAssign { target, op, value, span: _ } => {
+                    asm.push_str(&format!("    ; Augmented assignment to {} with {:?}\n", target, op));
+                    
+                    if let Some(offset) = self.get_variable_offset_rbp_relative(target) {
+                        let abs_offset = self.get_absolute_offset(offset);
+                        
+                        // Load current value
+                        asm.push_str(&format!("    mov rax, [rbp - {}]\n", abs_offset));
+                        asm.push_str("    push rax\n");
+                        
+                        // Compile right-hand side
+                        let value_code = self.compile_expression(value)?;
+                        asm.push_str(&value_code);
+                        
+                        asm.push_str("    mov rbx, rax\n");
+                        asm.push_str("    pop rax\n");
+                        
+                        // Perform operation
+                        match op {
+                            Op::Add => asm.push_str("    add rax, rbx\n"),
+                            Op::Sub => asm.push_str("    sub rax, rbx\n"),
+                            Op::Mul => asm.push_str("    imul rax, rbx\n"),
+                            Op::Div => {
+                                asm.push_str("    xor rdx, rdx\n");
+                                asm.push_str("    idiv rbx\n");
+                            }
+                            Op::Mod => {
+                                asm.push_str("    xor rdx, rdx\n");
+                                asm.push_str("    div rbx\n");
+                                asm.push_str("    mov rax, rdx\n");
+                            }
+                            _ => return Err(format!("Unsupported augmented assignment operator: {:?}", op)),
+                        }
+                        
+                        // Store back
+                        asm.push_str(&format!("    mov [rbp - {}], rax\n", abs_offset));
+                    } else {
+                        return Err(format!("Variable {} not found", target));
                     }
                 }
                 Statement::If { condition, then_block, elif_blocks, else_block, span: _ } => {
@@ -2821,7 +2909,7 @@ impl Backend for Linux64Backend {
                     let end_label = format!("if_end_{}", label_id);
                     
                     asm.push_str("    ; If condition\n");
-                    let cond_code = self.compile_expression(&condition)?;
+                    let cond_code = self.compile_expression(condition)?;
                     asm.push_str(&cond_code);
                     
                     asm.push_str("    test rax, rax\n");
@@ -2834,7 +2922,7 @@ impl Backend for Linux64Backend {
                     }
                     asm.push_str(&format!("    jmp {}\n", end_label));
                     
-                    // Use a reference to iterate
+                    // Process elif blocks
                     for (elif_cond, elif_body) in elif_blocks {
                         asm.push_str(&format!("{}:\n", else_label));
                         let elif_cond_code = self.compile_expression(elif_cond)?;
@@ -2842,36 +2930,28 @@ impl Backend for Linux64Backend {
                         asm.push_str("    test rax, rax\n");
                         asm.push_str(&format!("    jz {}_elif\n", else_label));
                         
+                        asm.push_str("    ; Elif body\n");
                         for stmt in elif_body {
-                            match stmt {
-                                Statement::Expr(expr) => {
-                                    let expr_code = self.compile_expression(&expr)?;
-                                    asm.push_str(&expr_code);
-                                }
-                                _ => {}
-                            }
+                            let stmt_code = self.compile_statement_in_context(stmt)?;
+                            asm.push_str(&stmt_code);
                         }
                         asm.push_str(&format!("    jmp {}\n", end_label));
                         asm.push_str(&format!("{}_elif:\n", else_label));
                     }
                     
-                    if let Some(else_body) = &else_block {
+                    // Process else block
+                    if let Some(else_body) = else_block {
                         if elif_blocks.is_empty() {
                             asm.push_str(&format!("{}:\n", else_label));
                         }
+                        
+                        asm.push_str("    ; Else block\n");
                         for stmt in else_body {
-                            match stmt {
-                                Statement::Expr(expr) => {
-                                    let expr_code = self.compile_expression(&expr)?;
-                                    asm.push_str(&expr_code);
-                                }
-                                _ => {}
-                            }
+                            let stmt_code = self.compile_statement_in_context(stmt)?;
+                            asm.push_str(&stmt_code);
                         }
-                    } else {
-                        if elif_blocks.is_empty() {
-                            asm.push_str(&format!("{}:\n", else_label));
-                        }
+                    } else if elif_blocks.is_empty() {
+                        asm.push_str(&format!("{}:\n", else_label));
                     }
                     
                     asm.push_str(&format!("{}:\n", end_label));
@@ -2881,47 +2961,65 @@ impl Backend for Linux64Backend {
                     let while_start = format!("while_start_{}", label_id);
                     let while_end = format!("while_end_{}", label_id);
                     
-                    // FIXED: Correct loop structure
                     asm.push_str("    ; While loop\n");
                     asm.push_str(&format!("{}:\n", while_start));
                     
                     // Compile condition
-                    let cond_code = self.compile_expression(&condition)?;
+                    let cond_code = self.compile_expression(condition)?;
                     asm.push_str(&cond_code);
                     
                     asm.push_str("    test rax, rax\n");
                     asm.push_str(&format!("    jz {}\n", while_end));
                     
-                    // Compile ALL statements in the body BEFORE the jump back
                     asm.push_str("    ; While body\n");
                     for stmt in body {
                         let stmt_code = self.compile_statement_in_context(stmt)?;
                         asm.push_str(&stmt_code);
                     }
                     
-                    // Jump back to start - MUST be AFTER all body statements
+                    // Jump back to start
                     asm.push_str(&format!("    jmp {}\n", while_start));
                     
-                    // End label comes AFTER the jump
+                    // End label
                     asm.push_str(&format!("{}:\n", while_end));
                 }
-                Statement::FunctionDef { name, .. } => {
-                    asm.push_str(&format!("    ; Function definition skipped: {}\n", name));
+                Statement::FunctionDef { name, args, body, span: _ } => {
+                    // Skip function compilation for now
+                    asm.push_str(&format!("    ; Function definition: {}\n", name));
                 }
-                _ => {
-                    asm.push_str("    ; [Statement type not implemented]\n");
+                Statement::HardwareFunctionDef { device, name, args, body, span: _ } => {
+                    asm.push_str(&format!("    ; Hardware function: {} for device {}\n", name, device));
+                }
+                Statement::Return(expr) => {
+                    asm.push_str("    ; Return statement\n");
+                    if let Some(expr) = expr {
+                        let expr_code = self.compile_expression(expr)?;
+                        asm.push_str(&expr_code);
+                    } else {
+                        asm.push_str("    xor rax, rax\n");
+                    }
+                    asm.push_str("    jmp .main_epilogue\n");
+                }
+                Statement::Pass => asm.push_str("    ; pass\n"),
+                Statement::Break => asm.push_str("    ; break\n"),
+                Statement::Continue => asm.push_str("    ; continue\n"),
+                Statement::Include { filename, span: _ } => {
+                    asm.push_str(&format!("    ; Include: {}\n", filename));
                 }
             }
         }
         
-        asm.push_str("    ; Return from main\n");
-        asm.push_str("    mov rax, 0\n");
+        // Main function epilogue
+        asm.push_str("\n.main_epilogue:\n");
+        asm.push_str("    ; Function epilogue\n");
         asm.push_str("    mov rsp, rbp\n");
         asm.push_str("    pop rbp\n");
         asm.push_str("    ret\n\n");
         
+        // Generate helper functions
         asm.push_str(&self.generate_helper_function());
         
+        // Generate data section
         asm.push_str("    section .data\n");
         asm.push_str("newline:\n");
         asm.push_str("    db 10, 0\n\n");
@@ -2942,8 +3040,11 @@ impl Backend for Linux64Backend {
                 Ok(format!("    ; String: '{}'\n    lea rax, [{}]\n", s, label))
             }
             Expr::Var(name, _) => {
-                if let Some(offset) = self.get_variable_offset_sp_relative(&name) {
-                    Ok(format!("    ; Variable: {}\n    mov rax, [rsp + {}]\n", name, offset))
+                // FIXED: Use RBP-relative addressing ONLY
+                if let Some(offset) = self.get_variable_offset_rbp_relative(name) {
+                    let abs_offset = self.get_absolute_offset(offset);
+                    Ok(format!("    ; Variable: {} at [rbp - {}]\n    mov rax, [rbp - {}]\n", 
+                               name, abs_offset, abs_offset))
                 } else {
                     Err(format!("Undefined variable: {}", name))
                 }
@@ -2966,9 +3067,10 @@ impl Backend for Linux64Backend {
                             code.push_str("    call print_decimal\n");
                         }
                         Expr::Var(name, _) => {
-                            if let Some(offset) = self.get_variable_offset_sp_relative(&name) {
+                            if let Some(offset) = self.get_variable_offset_rbp_relative(name) {
+                                let abs_offset = self.get_absolute_offset(offset);
                                 code.push_str(&format!("    ; Variable: {}\n", name));
-                                code.push_str(&format!("    mov rax, [rsp + {}]\n", offset));
+                                code.push_str(&format!("    mov rax, [rbp - {}]\n", abs_offset));
                                 code.push_str("    call print_decimal\n");
                             } else {
                                 return Err(format!("Undefined variable: {}", name));
@@ -2982,31 +3084,69 @@ impl Backend for Linux64Backend {
                 
                 Ok(code)
             }
+            Expr::Call { func, args, kwargs: _, span: _ } => {
+                // General function call
+                let mut code = String::new();
+                
+                code.push_str(&format!("    ; Function call: {}\n", func));
+                
+                // Process arguments
+                for (i, arg) in args.iter().enumerate() {
+                    let arg_code = self.compile_expression(arg)?;
+                    code.push_str(&arg_code);
+                    
+                    // Move to appropriate register (System V ABI)
+                    match i {
+                        0 => code.push_str("    mov rdi, rax\n"),
+                        1 => code.push_str("    mov rsi, rax\n"),
+                        2 => code.push_str("    mov rdx, rax\n"),
+                        3 => code.push_str("    mov rcx, rax\n"),
+                        4 => code.push_str("    mov r8, rax\n"),
+                        5 => code.push_str("    mov r9, rax\n"),
+                        _ => code.push_str("    push rax\n"),
+                    }
+                }
+                
+                // Align stack if needed
+                if args.len() > 6 {
+                    let extra_args = args.len() - 6;
+                    if extra_args % 2 != 0 {
+                        code.push_str("    sub rsp, 8\n");
+                    }
+                }
+                
+                // Call the function
+                code.push_str(&format!("    call {}\n", func));
+                
+                // Clean up stack
+                if args.len() > 6 {
+                    let extra_args = args.len() - 6;
+                    let stack_adjust = extra_args * 8;
+                    if extra_args % 2 != 0 {
+                        code.push_str(&format!("    add rsp, {}\n", stack_adjust + 8));
+                    } else {
+                        code.push_str(&format!("    add rsp, {}\n", stack_adjust));
+                    }
+                }
+                
+                Ok(code)
+            }
             Expr::BinOp { left, op, right, span: _ } => {
                 let mut code = String::new();
                 code.push_str("    ; Binary operation\n");
                 
-                fn get_value_code(backend: &Linux64Backend, expr: &Expr) -> Result<String, String> {
-                    match expr {
-                        Expr::Number(n, _) => Ok(format!("    mov rax, {}\n", n)),
-                        Expr::Var(name, _) => {
-                            if let Some(offset) = backend.get_variable_offset_sp_relative(&name) {
-                                Ok(format!("    mov rax, [rsp + {}]\n", offset))
-                            } else {
-                                Err(format!("Undefined variable: {}", name))
-                            }
-                        }
-                        _ => Err("Unsupported expression type".to_string()),
-                    }
-                }
-                
-                code.push_str(&get_value_code(self, left)?);
+                // Compile left operand
+                let left_code = self.compile_expression(left)?;
+                code.push_str(&left_code);
                 code.push_str("    push rax\n");
                 
-                code.push_str(&get_value_code(self, right)?);
+                // Compile right operand
+                let right_code = self.compile_expression(right)?;
+                code.push_str(&right_code);
                 code.push_str("    mov rbx, rax\n");
                 code.push_str("    pop rax\n");
                 
+                // Perform operation
                 match op {
                     Op::Add => code.push_str("    add rax, rbx\n"),
                     Op::Sub => code.push_str("    sub rax, rbx\n"),
@@ -3020,6 +3160,9 @@ impl Backend for Linux64Backend {
                         code.push_str("    div rbx\n");
                         code.push_str("    mov rax, rdx\n");
                     }
+                    Op::BitAnd => code.push_str("    and rax, rbx\n"),
+                    Op::BitOr => code.push_str("    or rax, rbx\n"),
+                    Op::BitXor => code.push_str("    xor rax, rbx\n"),
                     _ => return Err(format!("Unsupported operator: {:?}", op)),
                 }
                 
@@ -3029,25 +3172,14 @@ impl Backend for Linux64Backend {
                 let mut code = String::new();
                 code.push_str("    ; Comparison operation\n");
                 
-                fn get_value_code(backend: &Linux64Backend, expr: &Expr) -> Result<String, String> {
-                    match expr {
-                        Expr::Number(n, _) => Ok(format!("    mov rax, {}\n", n)),
-                        Expr::Var(name, _) => {
-                            if let Some(offset) = backend.get_variable_offset_sp_relative(&name) {
-                                Ok(format!("    mov rax, [rsp + {}]\n", offset))
-                            } else {
-                                Err(format!("Undefined variable: {}", name))
-                            }
-                        }
-                        _ => Err("Unsupported expression type".to_string()),
-                    }
-                }
-                
-                code.push_str(&get_value_code(self, left)?);
+                // Compile left operand
+                let left_code = self.compile_expression(left)?;
+                code.push_str(&left_code);
                 code.push_str("    push rax\n");
                 
                 if let Some(right_expr) = comparators.get(0) {
-                    code.push_str(&get_value_code(self, right_expr)?);
+                    let right_code = self.compile_expression(right_expr)?;
+                    code.push_str(&right_code);
                     code.push_str("    mov rbx, rax\n");
                     code.push_str("    pop rax\n");
                     
@@ -3078,21 +3210,18 @@ impl Backend for Linux64Backend {
                             code.push_str("    setge al\n");
                             code.push_str("    movzx rax, al\n");
                         }
-                        // Handle unsupported comparison operators
                         CompareOp::In | CompareOp::NotIn | CompareOp::Is | CompareOp::IsNot => {
-                            return Err(format!("Comparison operator {:?} not supported in Linux64 backend", ops[0]));
+                            return Err(format!("Comparison operator {:?} not supported", ops[0]));
                         }
                     }
                 } else {
                     code.push_str("    pop rax\n");
-                    return Err("Missing comparator in comparison expression".to_string());
+                    return Err("Missing comparator".to_string());
                 }
                 
                 Ok(code)
             }
-            _ => {
-                Err(format!("Unsupported expression: {:?}", expr))
-            }
+            _ => Err(format!("Unsupported expression: {:?}", expr)),
         }
     }
     

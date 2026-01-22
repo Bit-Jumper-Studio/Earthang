@@ -1,5 +1,6 @@
-
+// dont mind the warnings, im too lazy to remove them, its working, dont mess with something thats already working
 use std::collections::HashMap;
+use std::path::PathBuf;
 use crate::parser::{Program, Statement, Expr};
 use crate::backend::{Backend, BackendRegistry, BackendModule, Target, Capability};
 use crate::emitter::NasmEmitter;
@@ -14,10 +15,10 @@ pub struct CompilerConfig {
     pub include_stdlib: bool,
     pub hardware_dsl_enabled: bool,
     pub code_size_limit: Option<usize>,
-    // CLI-specific fields
     pub verbose: bool,
     pub keep_assembly: bool,
     pub modules: Vec<String>,
+    pub search_paths: Vec<PathBuf>,
 }
 
 impl Default for CompilerConfig {
@@ -32,6 +33,7 @@ impl Default for CompilerConfig {
             verbose: false,
             keep_assembly: false,
             modules: Vec::new(),
+            search_paths: vec![PathBuf::from("."), PathBuf::from("stdlib")],
         }
     }
 }
@@ -49,6 +51,11 @@ impl CompilerConfig {
     
     pub fn with_hardware_dsl(mut self, enabled: bool) -> Self {
         self.hardware_dsl_enabled = enabled;
+        self
+    }
+    
+    pub fn add_search_path<P: Into<PathBuf>>(mut self, path: P) -> Self {
+        self.search_paths.push(path.into());
         self
     }
 }
@@ -85,15 +92,10 @@ pub struct EarthangCompiler {
 
 #[derive(Debug, Clone)]
 struct VariableInfo {
-    #[allow(dead_code)]
     pub name: String,
-    #[allow(dead_code)]
     pub type_hint: Option<String>,
-    #[allow(dead_code)]
     pub scope_level: usize,
-    #[allow(dead_code)]
     pub is_hardware: bool,
-    #[allow(dead_code)]
     pub hardware_device: Option<String>,
 }
 
@@ -189,7 +191,6 @@ impl EarthangCompiler {
         }
     }
     
-    #[allow(dead_code)]
     fn handle_extension_call(
         &self,
         func: &str,
@@ -222,17 +223,36 @@ impl EarthangCompiler {
         
         let mut asm = emitter.compile_program(program)?;
         
-        asm.push_str("\n; ========== EXTENSION FUNCTIONS ==========\n; Note: Extension functions are supported via plugin system\n");
+        asm.push_str("\n; ========== EXTENSION FUNCTIONS ==========\n");
         
         Ok(asm)
     }
     
-    pub fn compile(&mut self, source: &str) -> Result<CompilationResult, String> {
+    pub fn compile<P: AsRef<std::path::Path>>(&mut self, file_path: P) -> Result<CompilationResult, String> {
         let start_time = std::time::Instant::now();
         
         self.warnings.clear();
         self.errors.clear();
         self.symbol_table.clear();
+        
+        let file_path = file_path.as_ref();
+        let source = std::fs::read_to_string(file_path)
+            .map_err(|e| format!("Failed to read file {}: {}", file_path.display(), e))?;
+        
+        self.compile_source(&source, Some(file_path))
+    }
+    
+    pub fn compile_source(&mut self, source: &str, source_path: Option<&std::path::Path>) -> Result<CompilationResult, String> {
+        let start_time = std::time::Instant::now();
+        
+        self.warnings.clear();
+        self.errors.clear();
+        self.symbol_table.clear();
+        
+        let mut include_processor = crate::lua_frontend::IncludeProcessor::new();
+        for path in &self.config.search_paths {
+            include_processor.add_search_path(path);
+        }
         
         let mut program = match crate::lua_frontend::parse_program(source) {
             Ok(program) => program,
@@ -244,6 +264,10 @@ impl EarthangCompiler {
                 return Err(format!("Parse errors:\n{}", error_messages.join("\n")));
             }
         };
+        
+        let base_dir = source_path.and_then(|p| p.parent().map(|p| p.to_path_buf()));
+        program = include_processor.process_includes(&program, base_dir.as_ref())
+            .map_err(|e| format!("Include processing error: {}", e))?;
         
         if self.config.optimize {
             for pass in &self.optimization_passes {
@@ -319,7 +343,7 @@ impl EarthangCompiler {
             functions_compiled: program.body.iter()
                 .filter(|stmt| matches!(stmt, Statement::FunctionDef { .. }))
                 .count(),
-            hardware_intrinsics: 0, // No longer tracking hardware intrinsics separately
+            hardware_intrinsics: 0,
             compilation_time_ms: compilation_time,
         };
         
@@ -581,8 +605,8 @@ impl EarthangCompiler {
         &self.errors
     }
     
-    pub fn compile_to_file(&mut self, source: &str, output_path: &str) -> Result<(), String> {
-        let result = self.compile(source)?;
+    pub fn compile_to_file<P: AsRef<std::path::Path>>(&mut self, source_path: P, output_path: P) -> Result<(), String> {
+        let result = self.compile(source_path)?;
         std::fs::write(output_path, result.assembly)
             .map_err(|e| format!("Failed to write output file: {}", e))?;
         Ok(())
@@ -637,24 +661,24 @@ impl OptimizationPass for InlineExpansionPass {
     }
 }
 
-pub fn compile(source: &str, target: Target) -> Result<CompilationResult, String> {
+pub fn compile<P: AsRef<std::path::Path>>(source_path: P, target: Target) -> Result<CompilationResult, String> {
     let config = CompilerConfig::default().with_target(target);
     let mut compiler = EarthangCompiler::new(config);
-    compiler.compile(source)
+    compiler.compile(source_path)
 }
 
-pub fn compile_with_hardware(source: &str, target: Target) -> Result<CompilationResult, String> {
+pub fn compile_with_hardware<P: AsRef<std::path::Path>>(source_path: P, target: Target) -> Result<CompilationResult, String> {
     let config = CompilerConfig::default()
         .with_target(target)
         .with_hardware_dsl(true);
     
     let mut compiler = EarthangCompiler::new(config);
-    compiler.compile(source)
+    compiler.compile(source_path)
 }
 
-pub fn compile_with_config(source: &str, config: CompilerConfig) -> Result<CompilationResult, String> {
+pub fn compile_with_config<P: AsRef<std::path::Path>>(source_path: P, config: CompilerConfig) -> Result<CompilationResult, String> {
     let mut compiler = EarthangCompiler::new(config);
-    compiler.compile(source)
+    compiler.compile(source_path)
 }
 
 pub fn parse(source: &str) -> Result<Program, String> {
@@ -696,8 +720,8 @@ pub fn format_result(result: &CompilationResult) -> String {
     output
 }
 
-pub fn compile_with_extensions(source: &str, target: Target) -> Result<CompilationResult, String> {
+pub fn compile_with_extensions<P: AsRef<std::path::Path>>(source_path: P, target: Target) -> Result<CompilationResult, String> {
     let config = CompilerConfig::default().with_target(target);
     let mut compiler = EarthangCompiler::new(config);
-    compiler.compile(source)
+    compiler.compile(source_path)
 }

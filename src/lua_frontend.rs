@@ -1,8 +1,8 @@
 use mlua::{Lua, Table, Error as LuaError};
 use serde::{Serialize, Deserialize};
 use std::collections::HashMap;
+use std::path::PathBuf;
 
-// Re-export types for backward compatibility
 pub use crate::backend::{Target, Capability};
 
 #[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
@@ -77,6 +77,11 @@ pub enum ParseError {
         help: Option<String>,
         context: Option<String>,
     },
+    IncludeError {
+        filename: String,
+        message: String,
+        span: Span,
+    },
 }
 
 impl ParseError {
@@ -93,6 +98,14 @@ impl ParseError {
         }
     }
     
+    pub fn include_error(filename: impl Into<String>, message: impl Into<String>, span: Span) -> Self {
+        ParseError::IncludeError {
+            filename: filename.into(),
+            message: message.into(),
+            span,
+        }
+    }
+    
     pub fn with_help(mut self, help: impl Into<String>) -> Self {
         match &mut self {
             ParseError::SyntaxError { help: h, .. } => *h = Some(help.into()),
@@ -104,6 +117,7 @@ impl ParseError {
     pub fn span(&self) -> Option<Span> {
         match self {
             ParseError::SyntaxError { span, .. } => Some(*span),
+            ParseError::IncludeError { span, .. } => Some(*span),
             _ => None,
         }
     }
@@ -116,6 +130,13 @@ impl ParseError {
             ParseError::SyntaxError { message, span, help, context } => {
                 self.format_detailed("syntax error", message, span, help.as_deref(), context.as_deref(), source)
             }
+            ParseError::IncludeError { filename, message, span } => {
+                let mut output = format!("include error at {}: {}: {}\n", span, filename, message);
+                if let Some(context) = self.extract_source_context(source, span) {
+                    output.push_str(&context);
+                }
+                output
+            }
         }
     }
     
@@ -124,24 +145,20 @@ impl ParseError {
         
         let mut output = String::new();
         
-        // Error header
         output.push_str(&format!("{}: {}: {}\n", 
             error_type.red().bold(),
             span.to_string().cyan(),
             message.bold()));
         
-        // Extract relevant source lines
         if let Some(source_context) = self.extract_source_context(source, span) {
             output.push_str(&source_context);
             output.push('\n');
         }
         
-        // Print context if available
         if let Some(context) = context {
             output.push_str(&format!("  {} {}\n", "context:".dimmed(), context));
         }
         
-        // Print help if available
         if let Some(help) = help {
             output.push_str(&format!("  {} {}\n", "help:".green().bold(), help.green()));
         }
@@ -161,7 +178,6 @@ impl ParseError {
         
         let mut context = String::new();
         
-        // Show up to 2 lines before and after
         let context_start = start_line_idx.saturating_sub(2);
         let context_end = std::cmp::min(end_line_idx + 2, lines.len() - 1);
         
@@ -169,15 +185,12 @@ impl ParseError {
             let line_num = i + 1;
             let line = lines[i];
             
-            // Line number
             context.push_str(&format!("{:4} │ {}\n", line_num, line));
             
-            // Error underline if this line contains the error
             if i >= start_line_idx && i <= end_line_idx {
                 let line_start_col = if i == start_line_idx { span.start.column } else { 1 };
                 let line_end_col = if i == end_line_idx { span.end.column } else { line.len() + 1 };
                 
-                // Add underline
                 context.push_str("     │ ");
                 for _ in 1..line_start_col {
                     context.push(' ');
@@ -202,6 +215,9 @@ impl std::fmt::Display for ParseError {
             ParseError::SyntaxError { message, span, .. } => {
                 write!(f, "syntax error at {}: {}", span, message)
             }
+            ParseError::IncludeError { filename, message, span } => {
+                write!(f, "include error at {} ({}): {}", span, filename, message)
+            }
         }
     }
 }
@@ -217,6 +233,7 @@ impl From<LuaError> for ParseError {
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub enum Op {
     Add, Sub, Mul, Div, Mod, Pow, FloorDiv,
+    BitAnd, BitOr, BitXor, // Added bitwise operators
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -287,6 +304,7 @@ pub enum Statement {
     Pass,
     Break,
     Continue,
+    Include { filename: String, span: Span },
 }
 
 impl Statement {
@@ -304,6 +322,7 @@ impl Statement {
             Statement::Pass => Span::single(Position::new(0, 0, 0)),
             Statement::Break => Span::single(Position::new(0, 0, 0)),
             Statement::Continue => Span::single(Position::new(0, 0, 0)),
+            Statement::Include { span, .. } => *span,
         }
     }
 }
@@ -329,12 +348,9 @@ impl LuaFrontend {
         let lua = self.lua_pool.get_instance()
             .ok_or_else(|| ParseError::lua_error("Failed to get Lua instance from pool"))?;
         
-        // Define the Lua parser script
         let parser_script = r#"
--- Lua-based Earthang Parser
 local parser = {}
 
--- Token types
 local TokenType = {
     KEYWORD = 1,
     IDENTIFIER = 2,
@@ -342,10 +358,10 @@ local TokenType = {
     STRING = 4,
     OPERATOR = 5,
     PUNCTUATION = 6,
-    EOF = 7,
+    COMMENT = 7,
+    EOF = 8,
 }
 
--- Keywords
 local keywords = {
     ["var"] = true,
     ["if"] = true,
@@ -365,9 +381,11 @@ local keywords = {
     ["True"] = true,
     ["False"] = true,
     ["None"] = true,
+    ["include"] = true,
+    ["section"] = true,
+    ["global"] = true,
 }
 
--- Operators
 local operators = {
     ["+"] = "ADD",
     ["-"] = "SUB",
@@ -386,9 +404,12 @@ local operators = {
     ["-="] = "SUB_ASSIGN",
     ["*="] = "MUL_ASSIGN",
     ["/="] = "DIV_ASSIGN",
+    ["&"] = "BIT_AND",
+    ["|"] = "BIT_OR",
+    ["^"] = "BIT_XOR",
+    ["~"] = "BIT_NOT",
 }
 
--- Lexer
 function parser.lex(source)
     local tokens = {}
     local pos = 1
@@ -418,11 +439,6 @@ function parser.lex(source)
                 pos = pos + 1
                 line = line + 1
                 col = 1
-            elseif c == '#' then
-                -- Skip comment
-                while pos <= #source and source:sub(pos, pos) ~= '\n' do
-                    pos = pos + 1
-                end
             else
                 break
             end
@@ -439,8 +455,44 @@ function parser.lex(source)
         
         local c = source:sub(pos, pos)
         
-        -- Numbers
-        if c:match('%d') then
+        -- Handle comments: #, //, and --
+        if c == '#' or (c == '/' and pos + 1 <= #source and source:sub(pos + 1, pos + 1) == '/') or 
+           (c == '-' and pos + 1 <= #source and source:sub(pos + 1, pos + 1) == '-') then
+            local comment = ''
+            while pos <= #source and source:sub(pos, pos) ~= '\n' do
+                comment = comment .. source:sub(pos, pos)
+                pos = pos + 1
+                col = col + 1
+            end
+            add_token(TokenType.COMMENT, comment, start_line, start_col, #comment)
+            goto continue
+        end
+        
+        if c == '0' and pos + 1 <= #source and source:sub(pos + 1, pos + 1):lower() == 'x' then
+            pos = pos + 2
+            col = col + 2
+            local hex_str = ''
+            local hex_digits = "0123456789ABCDEFabcdef"
+            
+            while pos <= #source do
+                local ch = source:sub(pos, pos)
+                if hex_digits:find(ch, 1, true) then
+                    hex_str = hex_str .. ch
+                    pos = pos + 1
+                    col = col + 1
+                else
+                    break
+                end
+            end
+            
+            if #hex_str == 0 then
+                error("Invalid hex literal at line " .. start_line .. ", col " .. start_col)
+            end
+            
+            local num = tonumber(hex_str, 16)
+            add_token(TokenType.NUMBER, num, start_line, start_col, #hex_str + 2)
+        
+        elseif c:match('%d') then
             local num_str = ''
             local is_float = false
             
@@ -450,7 +502,7 @@ function parser.lex(source)
                     num_str = num_str .. ch
                     pos = pos + 1
                     col = col + 1
-                elseif ch == '.' and source:sub(pos + 1, pos + 1):match('%d') then
+                elseif ch == '.' and pos + 1 <= #source and source:sub(pos + 1, pos + 1):match('%d') then
                     is_float = true
                     num_str = num_str .. ch
                     pos = pos + 1
@@ -466,7 +518,6 @@ function parser.lex(source)
                 add_token(TokenType.NUMBER, tonumber(num_str), start_line, start_col, #num_str)
             end
         
-        -- Strings
         elseif c == '"' or c == "'" then
             local quote = c
             pos = pos + 1
@@ -500,7 +551,6 @@ function parser.lex(source)
             
             add_token(TokenType.STRING, str, start_line, start_col, #str + 2)
         
-        -- Identifiers and keywords
         elseif c:match('[%a_]') then
             local ident = ''
             while pos <= #source do
@@ -520,9 +570,7 @@ function parser.lex(source)
                 add_token(TokenType.IDENTIFIER, ident, start_line, start_col, #ident)
             end
         
-        -- Operators
         else
-            -- Check for multi-character operators
             local two_char = source:sub(pos, pos + 1)
             if operators[two_char] then
                 add_token(TokenType.OPERATOR, two_char, line, col, 2)
@@ -533,7 +581,6 @@ function parser.lex(source)
                 pos = pos + 1
                 col = col + 1
             
-            -- Punctuation
             elseif c == '(' or c == ')' or c == '{' or c == '}' or 
                    c == '[' or c == ']' or c == ',' or c == ':' or 
                    c == ';' or c == '.' or c == '@' then
@@ -541,20 +588,22 @@ function parser.lex(source)
                 pos = pos + 1
                 col = col + 1
             
-            -- Unknown character
             else
-                error("Unexpected character: " .. c .. " at line " .. line .. ", col " .. col)
+                -- Skip unknown characters instead of throwing an error
+                -- This allows for inline assembly and other embedded code
+                pos = pos + 1
+                col = col + 1
             end
         end
+        
+        ::continue::
     end
     
-    -- Add EOF token
     add_token(TokenType.EOF, "EOF", line, col, 0)
     
     return tokens
 end
 
--- Parser
 function parser.parse(tokens)
     local pos = 1
     
@@ -585,7 +634,6 @@ function parser.parse(tokens)
         return false
     end
     
-    -- First, forward declare all expression parsing functions
     local parse_expression
     local parse_logical_or
     local parse_logical_and
@@ -595,7 +643,6 @@ function parser.parse(tokens)
     local parse_unary
     local parse_primary
     
-    -- Expression parsing - define functions in reverse order of dependency
     parse_primary = function()
         local token = current()
         
@@ -616,7 +663,6 @@ function parser.parse(tokens)
         elseif token.type == TokenType.IDENTIFIER then
             consume(TokenType.IDENTIFIER)
             
-            -- Check if it's a function call
             if match(TokenType.PUNCTUATION, "(") then
                 local args = {}
                 
@@ -680,6 +726,12 @@ function parser.parse(tokens)
                 op = "not",
                 operand = parse_unary()
             }
+        elseif match(TokenType.OPERATOR, "~") then
+            return {
+                type = "UnaryOp",
+                op = "~",
+                operand = parse_unary()
+            }
         else
             return parse_primary()
         end
@@ -709,6 +761,33 @@ function parser.parse(tokens)
                 }
             elseif match(TokenType.OPERATOR, "%") then
                 local op = "%"
+                local right = parse_unary()
+                left = {
+                    type = "BinOp",
+                    op = op,
+                    left = left,
+                    right = right
+                }
+            elseif match(TokenType.OPERATOR, "&") then
+                local op = "&"
+                local right = parse_unary()
+                left = {
+                    type = "BinOp",
+                    op = op,
+                    left = left,
+                    right = right
+                }
+            elseif match(TokenType.OPERATOR, "|") then
+                local op = "|"
+                local right = parse_unary()
+                left = {
+                    type = "BinOp",
+                    op = op,
+                    left = left,
+                    right = right
+                }
+            elseif match(TokenType.OPERATOR, "^") then
+                local op = "^"
                 local right = parse_unary()
                 left = {
                     type = "BinOp",
@@ -809,7 +888,6 @@ function parser.parse(tokens)
         return parse_logical_or()
     end
     
-    -- Statement parsing
     function parse_statement()
         local token = current()
         
@@ -833,10 +911,15 @@ function parser.parse(tokens)
             elseif token.value == "continue" then
                 consume(TokenType.KEYWORD)
                 return {type = "Continue"}
+            elseif token.value == "include" then
+                return parse_include_statement()
+            elseif token.value == "section" then
+                return parse_section_statement()
+            elseif token.value == "global" then
+                return parse_global_statement()
             end
         end
         
-        -- Assignment or expression
         if token.type == TokenType.IDENTIFIER then
             local lookahead = peek()
             if lookahead and lookahead.type == TokenType.OPERATOR and 
@@ -845,7 +928,6 @@ function parser.parse(tokens)
             end
         end
         
-        -- Expression statement
         local expr = parse_expression()
         if match(TokenType.PUNCTUATION, ";") then
             -- Optional semicolon
@@ -886,7 +968,6 @@ function parser.parse(tokens)
                 value = value
             }
         else
-            -- Augmented assignment
             local base_op = op:sub(1, -2)
             return {
                 type = "AugAssign",
@@ -1018,10 +1099,45 @@ function parser.parse(tokens)
         }
     end
     
-    -- Parse program
+    function parse_include_statement()
+        consume(TokenType.KEYWORD, "include")
+        local filename_token = consume(TokenType.STRING)
+        return {
+            type = "Include",
+            filename = filename_token.value
+        }
+    end
+    
+    function parse_section_statement()
+        consume(TokenType.KEYWORD, "section")
+        local name_token = consume(TokenType.STRING)
+        return {
+            type = "Section",
+            name = name_token.value
+        }
+    end
+    
+    function parse_global_statement()
+        consume(TokenType.KEYWORD, "global")
+        local name = consume(TokenType.IDENTIFIER).value
+        return {
+            type = "Global",
+            name = name
+        }
+    end
+    
+    -- Skip comments at the beginning
+    while current().type == TokenType.COMMENT do
+        pos = pos + 1
+    end
+    
     local statements = {}
     while current().type ~= TokenType.EOF do
-        table.insert(statements, parse_statement())
+        if current().type == TokenType.COMMENT then
+            pos = pos + 1
+        else
+            table.insert(statements, parse_statement())
+        end
     end
     
     return {
@@ -1033,10 +1149,8 @@ end
 return parser
 "#;
         
-        // Load the parser script
         let parser_module: Table = lua.load(parser_script).eval()?;
         
-        // Parse the source code
         let ast: Table = lua.scope(|_scope| {
             let parse_func: mlua::Function = parser_module.get("parse")?;
             let lex_func: mlua::Function = parser_module.get("lex")?;
@@ -1046,20 +1160,16 @@ return parser
             Ok(ast)
         })?;
         
-        // Convert Lua AST to Rust AST
         let program = self.convert_lua_ast_to_rust(&lua, &ast)?;
         
-        // Return Lua instance to pool
         self.lua_pool.return_instance(lua);
         
         Ok(program)
     }
     
     fn convert_lua_ast_to_rust(&self, lua: &Lua, lua_ast: &Table) -> Result<Program, ParseError> {
-        // Create a dummy span for now
         let dummy_span = Span::single(Position::start());
         
-        // Helper function to convert Lua value to Rust Expression
         fn convert_expr(lua: &Lua, expr_table: &Table, span: Span) -> Result<Expr, ParseError> {
             let expr_type: String = expr_table.get("type").map_err(|e| ParseError::lua_error(e.to_string()))?;
             
@@ -1090,6 +1200,9 @@ return parser
                         "/" => Op::Div,
                         "%" => Op::Mod,
                         "**" => Op::Pow,
+                        "&" => Op::BitAnd,
+                        "|" => Op::BitOr,
+                        "^" => Op::BitXor,
                         _ => return Err(ParseError::syntax_error(format!("Unknown operator: {}", op_str), span)),
                     };
                     
@@ -1112,6 +1225,7 @@ return parser
                         "-" => UnaryOp::Minus,
                         "+" => UnaryOp::Plus,
                         "not" => UnaryOp::Not,
+                        "~" => UnaryOp::Invert,
                         _ => return Err(ParseError::syntax_error(format!("Unknown unary operator: {}", op_str), span)),
                     };
                     
@@ -1204,7 +1318,6 @@ return parser
             }
         }
         
-        // Helper function to convert Lua value to Rust Statement
         fn convert_stmt(lua: &Lua, stmt_table: &Table, span: Span) -> Result<Statement, ParseError> {
             let stmt_type: String = stmt_table.get("type").map_err(|e| ParseError::lua_error(e.to_string()))?;
             
@@ -1244,6 +1357,9 @@ return parser
                         "-" => Op::Sub,
                         "*" => Op::Mul,
                         "/" => Op::Div,
+                        "&" => Op::BitAnd,
+                        "|" => Op::BitOr,
+                        "^" => Op::BitXor,
                         _ => return Err(ParseError::syntax_error(format!("Unknown augmented assignment operator: {}", op_str), span)),
                     };
                     
@@ -1283,7 +1399,6 @@ return parser
                         then_block.push(convert_stmt(lua, &stmt_table, span)?);
                     }
                     
-                    // FIXED: No generic type annotations
                     let elif_blocks_table: Table = stmt_table.get("elif_blocks")
                         .unwrap_or_else(|_| lua.create_table().unwrap());
                     
@@ -1308,7 +1423,6 @@ return parser
                         elif_blocks.push((elif_cond, elif_body));
                     }
                     
-                    // FIXED: No generic type annotations
                     let else_block = if let Ok(else_table) = stmt_table.get("else_block") {
                         let else_table: Table = else_table;
                         let else_len: i64 = else_table.len().map_err(|e: LuaError| ParseError::lua_error(e.to_string()))?;
@@ -1382,15 +1496,30 @@ return parser
                 "Pass" => Ok(Statement::Pass),
                 "Break" => Ok(Statement::Break),
                 "Continue" => Ok(Statement::Continue),
+                "Include" => {
+                    let filename: String = stmt_table.get("filename").map_err(|e| ParseError::lua_error(e.to_string()))?;
+                    Ok(Statement::Include {
+                        filename,
+                        span,
+                    })
+                }
+                "Section" => {
+                    // Convert section statement to a pass statement for now
+                    // This will be handled by the backend
+                    Ok(Statement::Pass)
+                }
+                "Global" => {
+                    // Convert global statement to a pass statement for now
+                    // This will be handled by the backend
+                    Ok(Statement::Pass)
+                }
                 _ => Err(ParseError::syntax_error(format!("Unknown statement type: {}", stmt_type), span)),
             }
         }
         
-        // Get the program body
         let body_table: Table = lua_ast.get("body").map_err(|e| ParseError::lua_error(e.to_string()))?;
         let body_len: i64 = body_table.len().map_err(|e: LuaError| ParseError::lua_error(e.to_string()))?;
         
-        // Convert all statements
         let mut statements = Vec::new();
         for i in 1..=body_len {
             let stmt_table: Table = body_table.get(i).map_err(|e| ParseError::lua_error(e.to_string()))?;
@@ -1403,41 +1532,32 @@ return parser
         })
     }
     
-    // Added helper function for Lua integration
     pub fn create_lua_system_functions(lua: &Lua) -> Result<(), ParseError> {
-        // Create a log function for debugging - FIXED: Added type annotation
         let log_func = lua.create_function(|_, (msg, level): (String, i32)| {
             println!("[LUA LOG level={}] {}", level, msg);
             Ok(())
         })?;
         
-        // Create a file open function - FIXED: Added type annotation
         let open_func = lua.create_function(|_, path: String| {
             println!("[LUA] Opening file: {}", path);
-            // In a real implementation, this would return a file handle
-            Ok(0) // Return a dummy file handle
+            Ok(0)
         })?;
         
-        // Create a file read function - FIXED: Added type annotation
         let read_func = lua.create_function(|_, handle: i32| {
             println!("[LUA] Reading from file handle: {}", handle);
             Ok("dummy file content".to_string())
         })?;
         
-        // Create a function with no parameters - FIXED: Added type annotation
         let version_func = lua.create_function(|_, (): ()| {
             println!("[LUA] Getting version");
             Ok("1.0.0".to_string())
         })?;
         
-        // Create a function with multiple parameters of different types
         let format_func = lua.create_function(|_, (template, _values): (String, Table)| {
             println!("[LUA] Formatting template: {}", template);
-            // In a real implementation, would format the string with values
             Ok(format!("Formatted: {}", template))
         })?;
         
-        // Register the functions in Lua global namespace - FIXED: No generic annotations
         let globals = lua.globals();
         globals.set("log", log_func)?;
         globals.set("open_file", open_func)?;
@@ -1455,7 +1575,103 @@ impl Default for LuaFrontend {
     }
 }
 
-// Public API function
+#[derive(Debug)]
+pub struct IncludeProcessor {
+    search_paths: Vec<PathBuf>,
+    visited_files: std::collections::HashSet<PathBuf>,
+}
+
+impl IncludeProcessor {
+    pub fn new() -> Self {
+        Self {
+            search_paths: vec![PathBuf::from("."), PathBuf::from("stdlib")],
+            visited_files: std::collections::HashSet::new(),
+        }
+    }
+    
+    pub fn add_search_path<P: Into<PathBuf>>(&mut self, path: P) {
+        self.search_paths.push(path.into());
+    }
+    
+    pub fn process_includes(&mut self, program: &Program, base_path: Option<&PathBuf>) -> Result<Program, ParseError> {
+        let mut expanded_statements = Vec::new();
+        let mut errors = Vec::new();
+        
+        for stmt in &program.body {
+            match stmt {
+                Statement::Include { filename, span } => {
+                    match self.resolve_and_include_file(filename, base_path, span) {
+                        Ok(included_program) => {
+                            expanded_statements.extend(included_program.body);
+                        }
+                        Err(err) => {
+                            errors.push(err);
+                        }
+                    }
+                }
+                _ => {
+                    expanded_statements.push(stmt.clone());
+                }
+            }
+        }
+        
+        if !errors.is_empty() {
+            return Err(errors[0].clone());
+        }
+        
+        Ok(Program {
+            body: expanded_statements,
+            span: program.span,
+        })
+    }
+    
+    fn resolve_and_include_file(&mut self, filename: &str, base_path: Option<&PathBuf>, span: &Span) -> Result<Program, ParseError> {
+        let mut paths_to_try = Vec::new();
+        
+        if let Some(base) = base_path {
+            paths_to_try.push(base.join(filename));
+        }
+        
+        for search_path in &self.search_paths {
+            paths_to_try.push(search_path.join(filename));
+        }
+        
+        for path in &paths_to_try {
+            if self.visited_files.contains(path) {
+                continue;
+            }
+            
+            if let Ok(content) = std::fs::read_to_string(path) {
+                self.visited_files.insert(path.clone());
+                
+                let frontend = LuaFrontend::new();
+                match frontend.parse_program(&content) {
+                    Ok(program) => {
+                        let parent_path = path.parent().map(|p| p.to_path_buf());
+                        match self.process_includes(&program, parent_path.as_ref()) {
+                            Ok(expanded) => return Ok(expanded),
+                            Err(err) => return Err(err),
+                        }
+                    }
+                    Err(err) => {
+                        return Err(ParseError::include_error(
+                            filename,
+                            format!("Failed to parse included file: {}", err),
+                            *span
+                        ));
+                    }
+                }
+            }
+        }
+        
+        Err(ParseError::include_error(
+            filename,
+            format!("File not found in search paths: {}", paths_to_try.iter().map(|p| p.display().to_string()).collect::<Vec<_>>().join(", ")),
+            *span
+        ))
+    }
+}
+
 pub fn parse_program(source: &str) -> Result<Program, Vec<ParseError>> {
     let frontend = LuaFrontend::new();
     match frontend.parse_program(source) {
@@ -1464,7 +1680,6 @@ pub fn parse_program(source: &str) -> Result<Program, Vec<ParseError>> {
     }
 }
 
-// Helper functions for backward compatibility
 pub fn create_semicolon_error(span: Span) -> ParseError {
     ParseError::syntax_error(
         "You forgot semicolon here",

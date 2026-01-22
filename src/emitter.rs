@@ -1,6 +1,6 @@
+// dont mind the warnings, im too lazy to remove them, its working, dont mess with something thats already working
 use std::collections::HashMap;
 use crate::parser::{Program, Statement, Expr, CompareOp};
-
 
 #[derive(Debug, Clone, PartialEq)]
 pub enum TargetPlatform {

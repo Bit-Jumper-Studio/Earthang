@@ -292,79 +292,91 @@ impl Cli {
     }
     
     fn handle_compile(&self, args: &CompileArgs, verbose: bool) -> Result<(), String> {
-        let progress = Progress::new(verbose);
+    let progress = Progress::new(verbose);
+    
+    if !self.quiet {
+        println!("{}", style::section("COMPILATION"));
+        println!("  {} {}", "Source:".cyan(), style::path(&args.file));
+        println!("  {} {}", "Target:".cyan(), style::target(&format!("{:?}", args.target)));
+    }
+    
+    let input_file = &args.file;
+    
+    // Check if file exists
+    if !input_file.exists() {
+        return Err(progress.error(&format!("File '{}' not found. Please check the filename and path.", input_file.display())));
+    }
+    
+    // Check if it's actually a file
+    if !input_file.is_file() {
+        return Err(progress.error(&format!("'{}' is not a valid file.", input_file.display())));
+    }
+    
+    let output_file = args.output.as_ref().map_or_else(|| {
+        let mut path = input_file.clone();
+        path.set_extension("bin");
+        path
+    }, |p| p.clone());
+    
+    let target: crate::backend::Target = args.target.into();
+    
+    progress.step("Reading source file...");
+    let source = std::fs::read_to_string(input_file)
+        .map_err(|e| progress.error(&format!("Failed to read source file '{}': {}", input_file.display(), e)))?;
+    
+    progress.step("Parsing syntax...");
+    crate::parser::parse_program(&source)
+        .map_err(|e| progress.error(&format!("Parse error in '{}': {:?}", input_file.display(), e)))?;
+    
+    if !self.quiet {
+        println!("  {} {}", "Output:".cyan(), style::path(&output_file));
+    }
+    
+    let config = CompilerConfig {
+        target,
+        verbose,
+        keep_assembly: args.keep_assembly,
+        optimize: !args.no_optimize,
+        modules: Vec::new(),
+        debug_info: false,
+        include_stdlib: false,
+        hardware_dsl_enabled: false,
+        code_size_limit: None,
+        search_paths: vec![PathBuf::from("."), PathBuf::from("stdlib")],
+    };
+    
+    progress.step("Compiling to assembly...");
+    let mut compiler = EarthangCompiler::new(config);
+    let result = compiler.compile_source(&source, Some(&input_file))?;
+    
+    progress.step("Writing output file...");
+    std::fs::write(&output_file, result.assembly)
+        .map_err(|e| progress.error(&format!("Failed to write output file '{}': {}", output_file.display(), e)))?;
+    
+    if !self.quiet {
+        progress.done("Compilation successful!");
+        println!();
         
-        if !self.quiet {
-            println!("{}", style::section("COMPILATION"));
-            println!("  {} {}", "Source:".cyan(), style::path(&args.file));
-            println!("  {} {}", "Target:".cyan(), style::target(&format!("{:?}", args.target)));
-        }
-        
-        let input_file = &args.file;
-        let output_file = args.output.as_ref().map_or_else(|| {
-            let mut path = input_file.clone();
-            path.set_extension("bin");
-            path
-        }, |p| p.clone());
-        
-        let target: crate::backend::Target = args.target.into();
-        
-        progress.step("Reading source file...");
-        let source = std::fs::read_to_string(input_file)
-            .map_err(|e| progress.error(&format!("Failed to read source file '{}': {}", input_file.display(), e)))?;
-        
-        progress.step("Parsing syntax...");
-        crate::parser::parse_program(&source)
-            .map_err(|e| progress.error(&format!("Parse error in '{}': {:?}", input_file.display(), e)))?;
-        
-        if !self.quiet {
-            println!("  {} {}", "Output:".cyan(), style::path(&output_file));
-        }
-        
-        let config = CompilerConfig {
-            target,
-            verbose,
-            keep_assembly: args.keep_assembly,
-            optimize: !args.no_optimize,
-            modules: Vec::new(),
-            debug_info: false,
-            include_stdlib: false,
-            hardware_dsl_enabled: false,
-            code_size_limit: None,
+        let target_type = match args.target {
+            CliTarget::Linux64 => "Linux ELF executable",
+            CliTarget::Bios16 | CliTarget::Bios32 | CliTarget::Bios64 |
+            CliTarget::Bios64Sse | CliTarget::Bios64Avx | CliTarget::Bios64Avx512 => "BIOS binary",
         };
         
-        progress.step("Compiling to assembly...");
-        let mut compiler = EarthangCompiler::new(config);
-        let result = compiler.compile(&source)?;
+        println!("  {} {} {} created", "✓".green(), target_type, style::path(&output_file).bold());
         
-        progress.step("Writing output file...");
-        std::fs::write(&output_file, result.assembly)
-            .map_err(|e| progress.error(&format!("Failed to write output file '{}': {}", output_file.display(), e)))?;
-        
-        if !self.quiet {
-            progress.done("Compilation successful!");
-            println!();
-            
-            let target_type = match args.target {
-                CliTarget::Linux64 => "Linux ELF executable",
-                CliTarget::Bios16 | CliTarget::Bios32 | CliTarget::Bios64 |
-                CliTarget::Bios64Sse | CliTarget::Bios64Avx | CliTarget::Bios64Avx512 => "BIOS binary",
-            };
-            
-            println!("  {} {} {} created", "✓".green(), target_type, style::path(&output_file).bold());
-            
-            if args.target == CliTarget::Linux64 {
-                println!("  {} Make executable: {}", ">".blue(), format!("chmod +x {}", output_file.display()).cyan());
-            }
-            
-            if args.keep_assembly {
-                let asm_file = output_file.with_extension("asm");
-                println!("  {} {}", "Assembly saved to:".dimmed(), style::path(&asm_file));
-            }
+        if args.target == CliTarget::Linux64 {
+            println!("  {} Make executable: {}", ">".blue(), format!("chmod +x {}", output_file.display()).cyan());
         }
         
-        Ok(())
+        if args.keep_assembly {
+            let asm_file = output_file.with_extension("asm");
+            println!("  {} {}", "Assembly saved to:".dimmed(), style::path(&asm_file));
+        }
     }
+    
+    Ok(())
+}
     
     fn handle_generate(&self, args: &GenerateArgs, verbose: bool) -> Result<(), String> {
         let progress = Progress::new(verbose);
