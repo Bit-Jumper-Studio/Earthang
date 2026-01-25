@@ -1113,91 +1113,192 @@ fn generate_utility_functions(&self) -> String {
     
     utils.push_str("; ========== UTILITY FUNCTIONS ==========\n\n");
     
-    // 64-bit print function for VGA text buffer
+    // Add cursor position variable in BSS section
+    utils.push_str("; Cursor position (offset from 0xB8000)\n");
+    utils.push_str("cursor_pos:\n");
+    utils.push_str("    dq 0\n\n");
+    
+    // Initialize cursor at the beginning
+    utils.push_str("; Initialize cursor position\n");
+    utils.push_str("init_cursor:\n");
+    utils.push_str("    xor rax, rax\n");
+    utils.push_str("    mov [cursor_pos], rax\n");
+    utils.push_str("    ret\n\n");
+    
+    // 64-bit print function for VGA text buffer with cursor tracking
     utils.push_str("; 64-bit print null-terminated string\n");
+    utils.push_str("; Input: RSI = string address\n");
     utils.push_str("print_string_64:\n");
     utils.push_str("    push rax\n");
     utils.push_str("    push rdi\n");
     utils.push_str("    push rsi\n");
     utils.push_str("    \n");
+    utils.push_str("    ; Calculate destination address: 0xB8000 + cursor_pos\n");
     utils.push_str("    mov rdi, 0xB8000\n");
-    utils.push_str("    add rdi, 160\n");
+    utils.push_str("    add rdi, [cursor_pos]\n");
     utils.push_str("    \n");
     utils.push_str(".print_loop:\n");
     utils.push_str("    mov al, [rsi]\n");
     utils.push_str("    test al, al\n");
     utils.push_str("    jz .print_done\n");
     utils.push_str("    \n");
+    utils.push_str("    ; Handle newline character\n");
+    utils.push_str("    cmp al, 10\n");
+    utils.push_str("    je .handle_newline\n");
+    utils.push_str("    cmp al, 13\n");
+    utils.push_str("    je .handle_newline\n");
+    utils.push_str("    \n");
+    utils.push_str("    ; Normal character\n");
     utils.push_str("    mov [rdi], al\n");
     utils.push_str("    inc rdi\n");
-    utils.push_str("    mov byte [rdi], 0x0F\n");
+    utils.push_str("    mov byte [rdi], 0x0F  ; White on black\n");
     utils.push_str("    inc rdi\n");
     utils.push_str("    inc rsi\n");
     utils.push_str("    jmp .print_loop\n");
     utils.push_str("    \n");
+    utils.push_str(".handle_newline:\n");
+    utils.push_str("    inc rsi\n");
+    utils.push_str("    ; Move to next line: cursor_pos = ((cursor_pos + 160) / 160) * 160\n");
+    utils.push_str("    mov rax, [cursor_pos]\n");
+    utils.push_str("    add rax, 160\n");
+    utils.push_str("    xor rdx, rdx\n");
+    utils.push_str("    mov rbx, 160\n");
+    utils.push_str("    div rbx\n");
+    utils.push_str("    mul rbx\n");
+    utils.push_str("    mov [cursor_pos], rax\n");
+    utils.push_str("    mov rdi, 0xB8000\n");
+    utils.push_str("    add rdi, rax\n");
+    utils.push_str("    jmp .print_loop\n");
+    utils.push_str("    \n");
     utils.push_str(".print_done:\n");
+    utils.push_str("    ; Update cursor position\n");
+    utils.push_str("    sub rdi, 0xB8000\n");
+    utils.push_str("    mov [cursor_pos], rdi\n");
+    utils.push_str("    \n");
     utils.push_str("    pop rsi\n");
     utils.push_str("    pop rdi\n");
+    utils.push_str("    pop rax\n");
+    utils.push_str("    ret\n\n");
+    
+    // Newline function
+    utils.push_str("; Print newline\n");
+    utils.push_str("print_newline_64:\n");
+    utils.push_str("    push rax\n");
+    utils.push_str("    push rdx\n");
+    utils.push_str("    push rbx\n");
+    utils.push_str("    \n");
+    utils.push_str("    ; Move to next line: cursor_pos = ((cursor_pos + 160) / 160) * 160\n");
+    utils.push_str("    mov rax, [cursor_pos]\n");
+    utils.push_str("    add rax, 160\n");
+    utils.push_str("    xor rdx, rdx\n");
+    utils.push_str("    mov rbx, 160\n");
+    utils.push_str("    div rbx\n");
+    utils.push_str("    mul rbx\n");
+    utils.push_str("    mov [cursor_pos], rax\n");
+    utils.push_str("    \n");
+    utils.push_str("    pop rbx\n");
+    utils.push_str("    pop rdx\n");
+    utils.push_str("    pop rax\n");
+    utils.push_str("    ret\n\n");
+    
+    // Clear screen function
+    utils.push_str("; Clear screen\n");
+    utils.push_str("clear_screen_64:\n");
+    utils.push_str("    push rax\n");
+    utils.push_str("    push rcx\n");
+    utils.push_str("    push rdi\n");
+    utils.push_str("    \n");
+    utils.push_str("    mov rdi, 0xB8000\n");
+    utils.push_str("    mov rax, 0x0720072007200720  ; Space with attribute\n");
+    utils.push_str("    mov rcx, 1000  ; 80x25 = 2000 characters, 1000 qwords\n");
+    utils.push_str("    rep stosq\n");
+    utils.push_str("    \n");
+    utils.push_str("    ; Reset cursor\n");
+    utils.push_str("    xor rax, rax\n");
+    utils.push_str("    mov [cursor_pos], rax\n");
+    utils.push_str("    \n");
+    utils.push_str("    pop rdi\n");
+    utils.push_str("    pop rcx\n");
     utils.push_str("    pop rax\n");
     utils.push_str("    ret\n\n");
     
     utils.push_str("; Print decimal number\n");
     utils.push_str("; Input: RAX = number to print\n");
     utils.push_str("print_decimal_64:\n");
-    utils.push_str("    push rax\n");
     utils.push_str("    push rbx\n");
     utils.push_str("    push rcx\n");
     utils.push_str("    push rdx\n");
     utils.push_str("    push rdi\n");
+    utils.push_str("    push rsi\n");
     utils.push_str("    \n");
-    utils.push_str("    test rax, rax\n");
-    utils.push_str("    jnz .not_zero\n");
+    utils.push_str("    ; Save the number\n");
+    utils.push_str("    mov rbx, rax\n");
     utils.push_str("    \n");
+    utils.push_str("    ; Get cursor position\n");
     utils.push_str("    mov rdi, 0xB8000\n");
-    utils.push_str("    add rdi, 320\n");
+    utils.push_str("    add rdi, [cursor_pos]\n");
+    utils.push_str("    \n");
+    utils.push_str("    ; Handle zero\n");
+    utils.push_str("    test rbx, rbx\n");
+    utils.push_str("    jnz .not_zero\n");
     utils.push_str("    mov byte [rdi], '0'\n");
     utils.push_str("    inc rdi\n");
     utils.push_str("    mov byte [rdi], 0x0F\n");
-    utils.push_str("    jmp .print_done_decimal\n");
+    utils.push_str("    inc rdi\n");
+    utils.push_str("    jmp .update_cursor\n");
     utils.push_str("    \n");
     utils.push_str(".not_zero:\n");
-    utils.push_str("    mov rcx, rax\n");
-    utils.push_str("    sar rcx, 63\n");
-    utils.push_str("    xor rax, rcx\n");
-    utils.push_str("    sub rax, rcx\n");
+    utils.push_str("    ; Handle negative numbers\n");
+    utils.push_str("    mov rsi, 0  ; Sign flag (0=positive, 1=negative)\n");
+    utils.push_str("    test rbx, rbx\n");
+    utils.push_str("    jns .positive\n");
+    utils.push_str("    neg rbx\n");
+    utils.push_str("    mov rsi, 1\n");
     utils.push_str("    \n");
-    utils.push_str("    mov rdi, 0xB8000\n");
-    utils.push_str("    add rdi, 320\n");
-    utils.push_str("    add rdi, 158\n");
-    utils.push_str("    \n");
-    utils.push_str("    mov rbx, 10\n");
+    utils.push_str(".positive:\n");
+    utils.push_str("    ; Convert to string in reverse\n");
     utils.push_str("    mov rcx, 0\n");
+    utils.push_str("    mov rax, rbx\n");
+    utils.push_str("    mov rdx, 0\n");
+    utils.push_str("    mov rbx, 10\n");
     utils.push_str("    \n");
     utils.push_str(".convert_loop:\n");
     utils.push_str("    xor rdx, rdx\n");
     utils.push_str("    div rbx\n");
     utils.push_str("    add dl, '0'\n");
-    utils.push_str("    mov [rdi], dl\n");
-    utils.push_str("    dec rdi\n");
-    utils.push_str("    mov byte [rdi], 0x0F\n");
-    utils.push_str("    dec rdi\n");
+    utils.push_str("    push rdx\n");
     utils.push_str("    inc rcx\n");
     utils.push_str("    test rax, rax\n");
     utils.push_str("    jnz .convert_loop\n");
     utils.push_str("    \n");
-    utils.push_str("    test rcx, rcx\n");
-    utils.push_str("    jns .print_done_decimal\n");
-    utils.push_str("    \n");
+    utils.push_str("    ; Print minus sign if negative\n");
+    utils.push_str("    test rsi, rsi\n");
+    utils.push_str("    jz .print_digits\n");
     utils.push_str("    mov byte [rdi], '-'\n");
-    utils.push_str("    dec rdi\n");
+    utils.push_str("    inc rdi\n");
     utils.push_str("    mov byte [rdi], 0x0F\n");
+    utils.push_str("    inc rdi\n");
     utils.push_str("    \n");
-    utils.push_str(".print_done_decimal:\n");
+    utils.push_str(".print_digits:\n");
+    utils.push_str("    ; Pop and print digits\n");
+    utils.push_str(".pop_loop:\n");
+    utils.push_str("    pop rax\n");
+    utils.push_str("    mov [rdi], al\n");
+    utils.push_str("    inc rdi\n");
+    utils.push_str("    mov byte [rdi], 0x0F\n");
+    utils.push_str("    inc rdi\n");
+    utils.push_str("    loop .pop_loop\n");
+    utils.push_str("    \n");
+    utils.push_str(".update_cursor:\n");
+    utils.push_str("    ; Update cursor position\n");
+    utils.push_str("    sub rdi, 0xB8000\n");
+    utils.push_str("    mov [cursor_pos], rdi\n");
+    utils.push_str("    \n");
+    utils.push_str("    pop rsi\n");
     utils.push_str("    pop rdi\n");
     utils.push_str("    pop rdx\n");
     utils.push_str("    pop rcx\n");
     utils.push_str("    pop rbx\n");
-    utils.push_str("    pop rax\n");
     utils.push_str("    ret\n");
     
     utils
@@ -2957,32 +3058,32 @@ impl Backend for Linux64Backend {
                     asm.push_str(&format!("{}:\n", end_label));
                 }
                 Statement::While { condition, body, orelse: _, span: _ } => {
-                    let label_id = self.get_next_label_id();
-                    let while_start = format!("while_start_{}", label_id);
-                    let while_end = format!("while_end_{}", label_id);
-                    
-                    asm.push_str("    ; While loop\n");
-                    asm.push_str(&format!("{}:\n", while_start));
-                    
-                    // Compile condition
-                    let cond_code = self.compile_expression(condition)?;
-                    asm.push_str(&cond_code);
-                    
-                    asm.push_str("    test rax, rax\n");
-                    asm.push_str(&format!("    jz {}\n", while_end));
-                    
-                    asm.push_str("    ; While body\n");
-                    for stmt in body {
-                        let stmt_code = self.compile_statement_in_context(stmt)?;
-                        asm.push_str(&stmt_code);
-                    }
-                    
-                    // Jump back to start
-                    asm.push_str(&format!("    jmp {}\n", while_start));
-                    
-                    // End label
-                    asm.push_str(&format!("{}:\n", while_end));
-                }
+    let label_id = self.get_next_label_id();
+    let while_start = format!("while_start_{}", label_id);
+    let while_end = format!("while_end_{}", label_id);
+    
+    asm.push_str("    ; While loop\n");
+    asm.push_str(&format!("{}:\n", while_start));
+    
+    // Compile condition
+    let cond_code = self.compile_expression(condition)?;
+    asm.push_str(&cond_code);
+    
+    asm.push_str("    test rax, rax\n");
+    asm.push_str(&format!("    jz {}\n", while_end));
+    
+    asm.push_str("    ; While body\n");
+    for stmt in body {
+        let stmt_code = self.compile_statement_in_context(stmt)?;
+        asm.push_str(&stmt_code);
+    }
+    
+    // Jump back to start (AFTER the body, but BEFORE the end label)
+    asm.push_str(&format!("    jmp {}\n", while_start));
+    
+    // End label
+    asm.push_str(&format!("{}:\n", while_end));
+}
                 Statement::FunctionDef { name, args, body, span: _ } => {
                     // Skip function compilation for now
                     asm.push_str(&format!("    ; Function definition: {}\n", name));

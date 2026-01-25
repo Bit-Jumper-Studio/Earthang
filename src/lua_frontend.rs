@@ -384,6 +384,7 @@ local keywords = {
     ["include"] = true,
     ["section"] = true,
     ["global"] = true,
+    ["end"] = true
 }
 
 local operators = {
@@ -1033,25 +1034,65 @@ function parser.parse(tokens)
     end
     
     function parse_while_statement()
-        consume(TokenType.KEYWORD, "while")
-        local condition = parse_expression()
-        consume(TokenType.PUNCTUATION, ":")
-        
-        local body = {}
-        if match(TokenType.PUNCTUATION, "{") then
-            while not match(TokenType.PUNCTUATION, "}") do
-                table.insert(body, parse_statement())
-            end
-        else
+    consume(TokenType.KEYWORD, "while")
+    local condition = parse_expression()
+    consume(TokenType.PUNCTUATION, ":")
+    
+    local body = {}
+    
+    -- Skip optional newline after colon
+    if current().type == TokenType.COMMENT and current().value:match("^[\r\n]") then
+        consume(TokenType.COMMENT)
+    end
+    
+    -- Check if we have a braced block (alternative syntax)
+    if match(TokenType.PUNCTUATION, "{") then
+        while not match(TokenType.PUNCTUATION, "}") do
             table.insert(body, parse_statement())
         end
-        
-        return {
-            type = "While",
-            condition = condition,
-            body = body
-        }
+    else
+        -- Parse statements until we hit the "end" keyword
+        -- This handles multi-statement while loops
+        while true do
+            local token = current()
+            
+            -- Check for "end" keyword
+            if token.type == TokenType.KEYWORD and token.value == "end" then
+                consume(TokenType.KEYWORD, "end")
+                break
+            end
+            
+            -- If we hit EOF, that's an error
+            if token.type == TokenType.EOF then
+                error("Unexpected end of file in while loop at line " .. token.line .. ", col " .. token.col)
+            end
+            
+            -- Parse the statement and add it to the body
+            local stmt = parse_statement()
+            table.insert(body, stmt)
+            
+            -- Check for end of file or "end" keyword after parsing
+            local next_token = current()
+            if next_token.type == TokenType.KEYWORD and next_token.value == "end" then
+                consume(TokenType.KEYWORD, "end")
+                break
+            elseif next_token.type == TokenType.EOF then
+                error("Missing 'end' for while loop")
+            end
+            
+            -- Skip optional semicolon
+            if match(TokenType.PUNCTUATION, ";") then
+                -- Just consume and continue
+            end
+        end
     end
+    
+    return {
+        type = "While",
+        condition = condition,
+        body = body
+    }
+end
     
     function parse_function_def()
         consume(TokenType.KEYWORD, "def")

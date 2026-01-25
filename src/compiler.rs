@@ -28,7 +28,7 @@ impl Default for CompilerConfig {
             optimize: true,
             debug_info: false,
             include_stdlib: true,
-            hardware_dsl_enabled: false,
+            hardware_dsl_enabled: true,
             code_size_limit: None,
             verbose: false,
             keep_assembly: false,
