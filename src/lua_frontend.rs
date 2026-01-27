@@ -1062,7 +1062,7 @@ function parser.parse(tokens)
                 break
             end
             
-            -- If we hit EOF, that's an error
+            -- If hit EOF, that's an error
             if token.type == TokenType.EOF then
                 error("Unexpected end of file in while loop at line " .. token.line .. ", col " .. token.col)
             end

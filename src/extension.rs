@@ -125,7 +125,7 @@ impl ExtensionRegistry {
         self.modules.push(module);
         // Load the first instance
         if !self.loaded_modules.contains_key(&name) {
-            // In a real implementation, we'd clone or use Arc
+            // TODO use Arc
         }
     }
     

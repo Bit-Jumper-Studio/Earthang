@@ -1058,7 +1058,7 @@ impl Bios64Backend {
                         }
                     }
                     "string" => {
-                        // For strings, we store the pointer to the string literal
+                        // For strings, store the pointer to the string literal
                         data.push_str(&format!("    dq {}\n", value));
                     }
                     _ => {
@@ -2245,7 +2245,7 @@ impl Backend for Bios64Backend {
     asm.push_str("    lidt [idtr_64]\n");
     asm.push_str("\n");
     asm.push_str("    ; Interrupts remain DISABLED in 64-bit mode\n");
-    asm.push_str("    ; (We don't have interrupt handlers set up)\n");
+    asm.push_str("    ; (don't have interrupt handlers set up)\n");
     asm.push_str("\n");
     
     // Clear screen for 64-bit mode
@@ -2509,7 +2509,7 @@ impl Backend for Bios64Backend {
     asm.push_str(&self.generate_bss_section());
     
     // Pad the binary to ensure all sectors are present
-    asm.push_str("\n    ; Pad to ensure we have enough sectors\n");
+    asm.push_str("\n    ; Pad to ensure have enough sectors\n");
     asm.push_str("    times 16384 - ($ - $$) db 0  ; 32 sectors total (16KB)\n");
     
     Ok(asm)
@@ -2889,7 +2889,7 @@ impl Backend for Linux64Backend {
             self.symbol_table.borrow_mut().clear();
         }
         
-        // Track the most negative offset we need
+        // Track the most negative offset need
         let mut max_negative_offset = 0;
         
         // Walk through program to allocate all variables
@@ -2918,7 +2918,7 @@ impl Backend for Linux64Backend {
         }
         
         // Allocate stack space based on the most negative offset
-        // Since offsets are negative, we need to allocate -max_negative_offset bytes
+        // Since offsets are negative, need to allocate -max_negative_offset bytes
         if max_negative_offset < 0 {
             let stack_space = (-max_negative_offset + 15) & !15;  // Round up to 16 bytes
             asm.push_str(&format!("    sub rsp, {}        ; Allocate {} bytes for locals\n", stack_space, stack_space));

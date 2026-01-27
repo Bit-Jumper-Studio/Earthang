@@ -40,7 +40,7 @@ impl DiskCache {
     pub fn new() -> Self {
         let cache_dir = "./.cache".to_string();
         
-        // Create cache directory if it doesn't exist
+        // initialize the cache directory to ensure persistent storage for compiled scripts between runs
         if let Err(e) = std::fs::create_dir_all(&cache_dir) {
             eprintln!("Warning: Could not create cache directory: {}", e);
         }
@@ -142,7 +142,7 @@ impl DiskCache {
         Ok((script_count, total_size))
     }
 
-     // New methods for Compiler compatibility
+     // allowing cache operations without breaking existing integrations
      pub fn clear(&self) -> Result<(), String> {
         if std::path::Path::new(&self.cache_dir).exists() {
             std::fs::remove_dir_all(&self.cache_dir)
